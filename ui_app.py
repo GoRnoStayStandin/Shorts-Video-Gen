@@ -11,6 +11,7 @@ from benchmark_tools import (
     OUTPUT_DIR,
     GPT4ALL_MODEL_PATH,
     GPT4All,
+    MODELS_DIR,
     ASR_DEVICE,
     FASTER_WHISPER_MODEL,
     FW_GPU_BATCH_SIZE,
@@ -68,6 +69,44 @@ UI_DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
 UI_PROJECTS_DIR.mkdir(exist_ok=True, parents=True)
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+
+def get_models_dir() -> Path:
+    if MODELS_DIR.is_absolute():
+        return MODELS_DIR
+    return Path(__file__).resolve().parent / MODELS_DIR
+
+
+def get_available_gpt4all_models():
+    candidates = []
+    seen = set()
+
+    default_path = Path(GPT4ALL_MODEL_PATH)
+    if default_path.exists():
+        resolved = default_path.resolve()
+        candidates.append(resolved)
+        seen.add(str(resolved).lower())
+
+    models_dir = get_models_dir()
+    if models_dir.exists():
+        for path in sorted(models_dir.rglob("*.gguf")):
+            resolved = path.resolve()
+            key = str(resolved).lower()
+            if key not in seen:
+                candidates.append(resolved)
+                seen.add(key)
+
+    return candidates
+
+
+def format_model_option(model_path: str) -> str:
+    path = Path(model_path)
+    models_dir = get_models_dir().resolve()
+
+    try:
+        return str(path.resolve().relative_to(models_dir))
+    except ValueError:
+        return path.name
 
 
 # Локальная страховка: чтобы ui_app.py не падал, даже если safe_filename не импортировался из benchmark_tools.
@@ -413,7 +452,10 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
     generate_metadata = bool(st.session_state.get("generate_topic_metadata", False))
     metadata_label = "metadata" if generate_metadata else "bounds"
     topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
-    topic_cache_path = topic_dir / f"topic_segments_{topic_mode}_{metadata_label}.json"
+    selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
+    selected_model_name = Path(selected_model_path).stem
+    model_cache_key = ui_safe_filename(selected_model_name, max_len=70)
+    topic_cache_path = topic_dir / f"topic_segments_{topic_mode}_{metadata_label}_{model_cache_key}.json"
 
     cached_topics = read_json_if_exists(str(topic_cache_path))
 
@@ -422,10 +464,10 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         st.session_state.topic_segments = cached_topics
         st.session_state.selected_position = 0
         progress_bar.progress(1.0)
-        status_box.success(f"Использую кэш ИИ-сегментации ({topic_mode_label} режим).")
+        status_box.success(f"Использую кэш ИИ-сегментации ({topic_mode_label} режим, {selected_model_name}).")
         return
 
-    status_box.info(f"Выделяю смысловые подтемы через GPT4All ({topic_mode_label} режим, {metadata_label})...")
+    status_box.info(f"Выделяю смысловые подтемы через GPT4All ({topic_mode_label} режим, {metadata_label}, {selected_model_name})...")
     progress_bar.progress(0.68)
 
     if GPT4All is None:
@@ -434,14 +476,14 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         progress_bar.progress(1.0)
         return
 
-    if not Path(GPT4ALL_MODEL_PATH).exists():
+    if not Path(selected_model_path).exists():
         st.session_state.topic_segments = []
-        status_box.error(f"Модель GPT4All не найдена: {GPT4ALL_MODEL_PATH}")
+        status_box.error(f"Модель GPT4All не найдена: {selected_model_path}")
         progress_bar.progress(1.0)
         return
 
     try:
-        model = load_gpt4all_model(n_ctx=4096)
+        model = load_gpt4all_model(n_ctx=4096, model_path=selected_model_path)
     except Exception as e:
         st.session_state.topic_segments = []
         status_box.error(f"Не удалось загрузить GPT4All: {e}")
@@ -494,6 +536,8 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
             "max_tokens": topic_max_tokens,
             "fast_mode": is_fast_topic_mode,
             "generate_metadata": generate_metadata,
+            "model_path": selected_model_path,
+            "model_name": selected_model_name,
         }
     )
 
@@ -826,15 +870,16 @@ def render_workspace():
 
         if st.button("Перегенерировать название и summary", use_container_width=True):
             current_text = st.session_state.get(text_key, selected_seg.get("text", ""))
+            selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
 
             if GPT4All is None:
                 st.error("gpt4all не установлен.")
-            elif not Path(GPT4ALL_MODEL_PATH).exists():
-                st.error(f"Модель GPT4All не найдена: {GPT4ALL_MODEL_PATH}")
+            elif not Path(selected_model_path).exists():
+                st.error(f"Модель GPT4All не найдена: {selected_model_path}")
             else:
                 with st.spinner("Перегенерирую описание текущего клипа..."):
                     try:
-                        model = load_gpt4all_model(n_ctx=4096)
+                        model = load_gpt4all_model(n_ctx=4096, model_path=selected_model_path)
                         analysis = analyze_topic_with_gpt4all_model(
                             model=model,
                             text=current_text
@@ -849,6 +894,7 @@ def render_workspace():
                 selected_seg["title"] = analysis.get("title")
                 selected_seg["summary"] = analysis.get("summary")
                 selected_seg["analysis_error"] = analysis.get("error")
+                selected_seg["analysis_model"] = selected_model_path
 
                 st.session_state[title_key] = selected_seg["title"] or ""
                 st.session_state[summary_key] = selected_seg["summary"] or ""
@@ -1270,6 +1316,28 @@ with st.expander("Настройки ускорения", expanded=False):
         "ASR_DEVICE, FW_GPU_BATCH_SIZE, GPT4ALL_DEVICE, USE_NVENC_FOR_EXPORT."
     )
 
+available_model_paths = [str(path) for path in get_available_gpt4all_models()]
+previous_model_path = st.session_state.get("gpt4all_model_path")
+
+if available_model_paths:
+    model_index = 0
+    if previous_model_path in available_model_paths:
+        model_index = available_model_paths.index(previous_model_path)
+
+    selected_gpt4all_model_path = st.selectbox(
+        "LLM-модель для GPT4All",
+        options=available_model_paths,
+        index=model_index,
+        format_func=format_model_option,
+        help="Положите новые .gguf модели в папку models, затем перезапустите Streamlit или обновите страницу."
+    )
+else:
+    selected_gpt4all_model_path = str(GPT4ALL_MODEL_PATH)
+    st.warning(f"В папке `{get_models_dir()}` не найдены .gguf модели. Текущий путь: `{selected_gpt4all_model_path}`")
+
+model_changed = previous_model_path and previous_model_path != selected_gpt4all_model_path
+st.session_state.gpt4all_model_path = selected_gpt4all_model_path
+
 topic_mode_label = st.radio(
     "Режим ИИ-сегментации",
     options=["Быстрый", "Качественный"],
@@ -1294,7 +1362,7 @@ metadata_changed = (
     and st.session_state.generate_topic_metadata != generate_topic_metadata
 )
 
-if mode_changed or metadata_changed:
+if mode_changed or metadata_changed or model_changed:
     for key in ["topic_segments", "selected_position", "generated_srt_by_clip", "exported_clip_by_clip", "preview_clip_by_clip"]:
         st.session_state.pop(key, None)
 

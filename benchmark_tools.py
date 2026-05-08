@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -67,9 +68,34 @@ GPT4ALL_MODEL_PATH = os.getenv(
     "GPT4ALL_MODEL_PATH",
     "C:/vs/Practice/models/mistral-7b-instruct-v0.1.Q4_0.gguf"
 )
+MODELS_DIR = Path(os.getenv("MODELS_DIR", "models"))
 
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+def resolve_media_bin(env_name: str, executable: str) -> str:
+    override = os.getenv(env_name)
+    if override:
+        return override
+
+    found = shutil.which(executable)
+    if found:
+        return found
+
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        winget_packages_dir = Path(local_appdata) / "Microsoft" / "WinGet" / "Packages"
+        if winget_packages_dir.exists():
+            matches = sorted(
+                winget_packages_dir.glob(f"**/{executable}.exe"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if matches:
+                return str(matches[0])
+
+    return executable
+
+
+FFMPEG_BIN = resolve_media_bin("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = resolve_media_bin("FFPROBE_BIN", "ffprobe")
 
 LANGUAGE = os.getenv("LANGUAGE", "ru")
 
@@ -686,7 +712,7 @@ def transcribe_with_faster_whisper(
 # GPT4ALL
 # =========================
 
-def load_gpt4all_model(n_ctx: int = 4096):
+def load_gpt4all_model(n_ctx: int = 4096, model_path: Optional[str] = None):
     """
     Загружает GPT4All.
     Важно: у некоторых версий gpt4all параметры n_ctx/device могут отличаться,
@@ -695,11 +721,13 @@ def load_gpt4all_model(n_ctx: int = 4096):
     if GPT4All is None:
         raise RuntimeError("gpt4all не установлен")
 
-    if not Path(GPT4ALL_MODEL_PATH).exists():
-        raise RuntimeError(f"Модель GPT4All не найдена: {GPT4ALL_MODEL_PATH}")
+    selected_model_path = str(model_path or GPT4ALL_MODEL_PATH)
+
+    if not Path(selected_model_path).exists():
+        raise RuntimeError(f"Модель GPT4All не найдена: {selected_model_path}")
 
     base_kwargs = {
-        "model_name": GPT4ALL_MODEL_PATH,
+        "model_name": selected_model_path,
         "allow_download": False,
         "n_ctx": n_ctx,
     }
@@ -714,14 +742,17 @@ def load_gpt4all_model(n_ctx: int = 4096):
 
     # CPU fallback — самый стабильный вариант на Windows.
     attempts.append({**base_kwargs, "device": "cpu"})
-    attempts.append({"model_name": GPT4ALL_MODEL_PATH, "allow_download": False, "device": "cpu"})
-    attempts.append({"model_name": GPT4ALL_MODEL_PATH, "allow_download": False})
+    attempts.append({"model_name": selected_model_path, "allow_download": False, "device": "cpu"})
+    attempts.append({"model_name": selected_model_path, "allow_download": False})
 
     last_error = None
 
     for kwargs in attempts:
         try:
-            print(f"[INFO] Loading GPT4All device={kwargs.get('device', 'default')} n_ctx={kwargs.get('n_ctx', 'default')}")
+            print(
+                f"[INFO] Loading GPT4All model={selected_model_path} "
+                f"device={kwargs.get('device', 'default')} n_ctx={kwargs.get('n_ctx', 'default')}"
+            )
             return GPT4All(**kwargs)
         except TypeError as e:
             last_error = e
