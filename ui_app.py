@@ -11,18 +11,41 @@ from benchmark_tools import (
     OUTPUT_DIR,
     GPT4ALL_MODEL_PATH,
     GPT4All,
+    ASR_DEVICE,
+    FASTER_WHISPER_MODEL,
+    FW_GPU_BATCH_SIZE,
+    GPT4ALL_DEVICE,
+    GPT4ALL_FAST_TOPIC_MAX_TOKENS,
+    GPT4ALL_TOPIC_MAX_TOKENS,
+    TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW,
+    TOPIC_FAST_OVERLAP_SEGMENTS,
+    TOPIC_MAX_SEGMENTS_PER_WINDOW,
+    TOPIC_OVERLAP_SEGMENTS,
+    USE_NVENC_FOR_EXPORT,
     analyze_topic_with_gpt4all_model,
     build_srt_for_clip,
     clean_text_for_topic_analysis,
+    download_video_from_url,
     export_clip_with_optional_srt,
     format_timestamp,
     get_video_duration_sec,
+    is_supported_video_url,
     llm_topic_segmentation,
     load_gpt4all_model,
     make_topic_label,
+    read_json_if_exists,
     safe_filename,
     save_json,
+    score_topic_segment_v2,
     transcribe_with_faster_whisper,
+)
+from timestamp_eval import (
+    block_to_intervals,
+    evaluate_segments,
+    format_timestamp as format_eval_timestamp,
+    infer_duration,
+    parse_blocks as parse_timestamp_blocks,
+    parse_timestamp as parse_eval_timestamp,
 )
 
 
@@ -37,10 +60,14 @@ st.set_page_config(
 )
 
 UI_UPLOAD_DIR = OUTPUT_DIR / "ui_uploads"
+UI_DOWNLOAD_DIR = OUTPUT_DIR / "ui_downloads"
 UI_PROJECTS_DIR = OUTPUT_DIR / "ui_projects"
 
 UI_UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
+UI_DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
 UI_PROJECTS_DIR.mkdir(exist_ok=True, parents=True)
+
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 
 # Локальная страховка: чтобы ui_app.py не падал, даже если safe_filename не импортировался из benchmark_tools.
@@ -65,20 +92,25 @@ def reset_processing_state():
         "selected_position",
         "generated_srt_by_clip",
         "exported_clip_by_clip",
+        "preview_clip_by_clip",
+        "upload_signature",
+        "source_url",
+        "source_path",
+        "source_type",
     ]
 
     for key in keys_to_remove:
         st.session_state.pop(key, None)
 
     for key in list(st.session_state.keys()):
-        if key.startswith("title_") or key.startswith("summary_") or key.startswith("text_"):
+        if key.startswith(("title_", "summary_", "text_", "start_", "end_", "range_", "aspect_", "subtitle_")):
             st.session_state.pop(key, None)
 
 
 def save_uploaded_video(uploaded_file):
     signature = f"{uploaded_file.name}:{uploaded_file.size}"
 
-    if st.session_state.get("upload_signature") == signature:
+    if st.session_state.get("upload_signature") == signature and st.session_state.get("video_path"):
         return
 
     reset_processing_state()
@@ -96,8 +128,114 @@ def save_uploaded_video(uploaded_file):
     st.session_state.upload_signature = signature
     st.session_state.video_path = str(upload_path)
     st.session_state.project_dir = str(project_dir)
+    st.session_state.source_url = None
+    st.session_state.source_path = None
+    st.session_state.source_type = "upload"
     st.session_state.generated_srt_by_clip = {}
     st.session_state.exported_clip_by_clip = {}
+    st.session_state.preview_clip_by_clip = {}
+
+
+def select_video_from_local_path(path_text: str):
+    raw_path = str(path_text or "").strip().strip('"').strip("'")
+
+    if not raw_path:
+        st.error("Укажите путь к видеофайлу на этом компьютере.")
+        return
+
+    video_path = Path(raw_path).expanduser()
+
+    if not video_path.exists():
+        st.error(f"Файл не найден: {video_path}")
+        return
+
+    if not video_path.is_file():
+        st.error(f"Указанный путь не является файлом: {video_path}")
+        return
+
+    if video_path.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+        st.error("Поддерживаются видеофайлы: mp4, mov, mkv, avi, webm, m4v.")
+        return
+
+    video_path = video_path.resolve()
+    stat = video_path.stat()
+    signature = f"path:{str(video_path).lower()}:{stat.st_size}:{stat.st_mtime_ns}"
+
+    if st.session_state.get("upload_signature") == signature and st.session_state.get("video_path"):
+        return
+
+    reset_processing_state()
+
+    timestamp = int(time.time())
+    project_name = f"{ui_safe_filename(video_path.stem)}_{timestamp}"
+    project_dir = UI_PROJECTS_DIR / project_name
+    project_dir.mkdir(exist_ok=True, parents=True)
+
+    st.session_state.upload_signature = signature
+    st.session_state.video_path = str(video_path)
+    st.session_state.project_dir = str(project_dir)
+    st.session_state.source_url = None
+    st.session_state.source_path = str(video_path)
+    st.session_state.source_type = "path"
+    st.session_state.generated_srt_by_clip = {}
+    st.session_state.exported_clip_by_clip = {}
+    st.session_state.preview_clip_by_clip = {}
+
+    st.success(f"Видео выбрано: {video_path.name}")
+
+
+def download_video_from_link(video_url: str):
+    video_url = str(video_url or "").strip()
+
+    if not video_url:
+        st.error("Вставьте ссылку на публичное видео YouTube или VK.")
+        return
+
+    if not is_supported_video_url(video_url):
+        st.error("Поддерживаются только публичные ссылки YouTube, YouTube Shorts, VK и VK Video.")
+        return
+
+    signature = f"url:{video_url}"
+
+    if st.session_state.get("upload_signature") == signature and st.session_state.get("video_path"):
+        return
+
+    reset_processing_state()
+
+    progress_bar = st.progress(0)
+    status_box = st.empty()
+
+    def download_progress(progress_value, message):
+        progress_bar.progress(min(max(float(progress_value), 0.0), 1.0))
+        status_box.info(message)
+
+    try:
+        video_path = download_video_from_url(
+            url=video_url,
+            out_dir=UI_DOWNLOAD_DIR,
+            progress_callback=download_progress
+        )
+    except Exception as e:
+        status_box.error(f"Не удалось скачать видео: {e}")
+        progress_bar.progress(1.0)
+        return
+
+    timestamp = int(time.time())
+    project_name = f"{ui_safe_filename(video_path.stem)}_{timestamp}"
+    project_dir = UI_PROJECTS_DIR / project_name
+    project_dir.mkdir(exist_ok=True, parents=True)
+
+    st.session_state.upload_signature = signature
+    st.session_state.video_path = str(video_path)
+    st.session_state.project_dir = str(project_dir)
+    st.session_state.source_url = video_url
+    st.session_state.source_path = None
+    st.session_state.source_type = "url"
+    st.session_state.generated_srt_by_clip = {}
+    st.session_state.exported_clip_by_clip = {}
+    st.session_state.preview_clip_by_clip = {}
+
+    status_box.success(f"Видео скачано: {video_path.name}")
 
 
 # =========================
@@ -257,11 +395,38 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         progress_bar.progress(1.0)
         return
 
-    status_box.info("Выделяю смысловые подтемы через GPT4All...")
-    progress_bar.progress(0.68)
-
     topic_dir = project_dir / "topic_segmentation"
     topic_dir.mkdir(exist_ok=True, parents=True)
+
+    topic_mode = st.session_state.get("topic_mode", "fast")
+    is_fast_topic_mode = topic_mode == "fast"
+
+    if is_fast_topic_mode:
+        topic_mode_label = "быстрый"
+        topic_max_segments = TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW
+        topic_overlap = TOPIC_FAST_OVERLAP_SEGMENTS
+    else:
+        topic_mode_label = "качественный"
+        topic_max_segments = TOPIC_MAX_SEGMENTS_PER_WINDOW
+        topic_overlap = TOPIC_OVERLAP_SEGMENTS
+
+    generate_metadata = bool(st.session_state.get("generate_topic_metadata", False))
+    metadata_label = "metadata" if generate_metadata else "bounds"
+    topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
+    topic_cache_path = topic_dir / f"topic_segments_{topic_mode}_{metadata_label}.json"
+
+    cached_topics = read_json_if_exists(str(topic_cache_path))
+
+    if isinstance(cached_topics, list) and cached_topics:
+        save_json(topic_dir / "topic_segments.json", cached_topics)
+        st.session_state.topic_segments = cached_topics
+        st.session_state.selected_position = 0
+        progress_bar.progress(1.0)
+        status_box.success(f"Использую кэш ИИ-сегментации ({topic_mode_label} режим).")
+        return
+
+    status_box.info(f"Выделяю смысловые подтемы через GPT4All ({topic_mode_label} режим, {metadata_label})...")
+    progress_bar.progress(0.68)
 
     if GPT4All is None:
         st.session_state.topic_segments = []
@@ -292,10 +457,13 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         enriched = llm_topic_segmentation(
             whisper_segments=fw_segments,
             model=model,
-            max_segments_per_window=8,
-            overlap_segments=2,
+            max_segments_per_window=topic_max_segments,
+            overlap_segments=topic_overlap,
             min_topic_duration_sec=8.0,
             max_topic_duration_sec=240.0,
+            fast_mode=is_fast_topic_mode,
+            generate_metadata=generate_metadata,
+            topic_max_tokens=topic_max_tokens,
             progress_callback=topic_progress
         )
 
@@ -314,7 +482,20 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         progress_bar.progress(1.0)
         return
 
+    save_json(topic_cache_path, enriched)
     save_json(topic_dir / "topic_segments.json", enriched)
+    save_json(
+        topic_dir / "topic_segmentation_settings.json",
+        {
+            "mode": topic_mode,
+            "mode_label": topic_mode_label,
+            "max_segments_per_window": topic_max_segments,
+            "overlap_segments": topic_overlap,
+            "max_tokens": topic_max_tokens,
+            "fast_mode": is_fast_topic_mode,
+            "generate_metadata": generate_metadata,
+        }
+    )
 
     st.session_state.topic_segments = enriched
     st.session_state.selected_position = 0
@@ -333,17 +514,31 @@ def ensure_clip_widget_defaults(seg):
     title_key = f"title_{clip_id}"
     summary_key = f"summary_{clip_id}"
     text_key = f"text_{clip_id}"
+    start_key = f"start_{clip_id}"
+    end_key = f"end_{clip_id}"
+    range_key = f"range_{clip_id}"
 
-    if title_key not in st.session_state:
+    refresh_widgets = st.session_state.pop(f"refresh_clip_widgets_{clip_id}", False)
+
+    if refresh_widgets or title_key not in st.session_state:
         st.session_state[title_key] = seg.get("title") or ""
 
-    if summary_key not in st.session_state:
+    if refresh_widgets or summary_key not in st.session_state:
         st.session_state[summary_key] = seg.get("summary") or ""
 
-    if text_key not in st.session_state:
+    if refresh_widgets or text_key not in st.session_state:
         st.session_state[text_key] = seg.get("text") or ""
 
-    return title_key, summary_key, text_key
+    if refresh_widgets or start_key not in st.session_state:
+        st.session_state[start_key] = format_timestamp(seg.get("start", 0))
+
+    if refresh_widgets or end_key not in st.session_state:
+        st.session_state[end_key] = format_timestamp(seg.get("end", 0))
+
+    if refresh_widgets or range_key not in st.session_state:
+        st.session_state[range_key] = (float(seg.get("start", 0) or 0), float(seg.get("end", 0) or 0))
+
+    return title_key, summary_key, text_key, start_key, end_key, range_key
 
 
 def apply_widget_values_to_segment(position: int):
@@ -387,6 +582,104 @@ def generate_srt_for_clip(seg, fw_segments, project_dir: Path):
     return srt_path
 
 
+def parse_ui_timestamp(value: str) -> float:
+    value = str(value or "").strip().replace(",", ".")
+
+    if not value:
+        raise ValueError("пустой таймкод")
+
+    if ":" not in value:
+        return float(value)
+
+    parts = value.split(":")
+
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return int(minutes) * 60 + float(seconds)
+
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    raise ValueError(f"некорректный таймкод: {value}")
+
+
+def build_clip_text_from_range(fw_segments, clip_start: float, clip_end: float) -> str:
+    parts = []
+
+    for seg in fw_segments:
+        seg_start = float(seg.get("start", 0))
+        seg_end = float(seg.get("end", seg_start))
+
+        if seg_end <= clip_start or seg_start >= clip_end:
+            continue
+
+        text = str(seg.get("text", "")).strip()
+        if text:
+            parts.append(text)
+
+    return clean_text_for_topic_analysis(" ".join(parts))
+
+
+def find_asr_ids_for_range(fw_segments, clip_start: float, clip_end: float):
+    matched_ids = []
+
+    for idx, seg in enumerate(fw_segments):
+        seg_start = float(seg.get("start", 0))
+        seg_end = float(seg.get("end", seg_start))
+
+        if seg_end > clip_start and seg_start < clip_end:
+            matched_ids.append(idx)
+
+    if not matched_ids:
+        return None, None
+
+    return matched_ids[0], matched_ids[-1]
+
+
+def clear_clip_outputs(clip_id):
+    clip_key = str(clip_id)
+    st.session_state.setdefault("generated_srt_by_clip", {}).pop(clip_key, None)
+    st.session_state.setdefault("exported_clip_by_clip", {}).pop(clip_key, None)
+    st.session_state.setdefault("preview_clip_by_clip", {}).pop(clip_key, None)
+
+
+def apply_clip_boundaries(position: int, new_start: float, new_end: float, fw_segments, media_duration: float):
+    seg = apply_widget_values_to_segment(position)
+    clip_id = seg["id"]
+
+    media_duration = float(media_duration or 0)
+    new_start = max(0.0, float(new_start))
+    new_end = max(0.0, float(new_end))
+
+    if media_duration > 0:
+        new_start = min(new_start, media_duration)
+        new_end = min(new_end, media_duration)
+
+    if new_end <= new_start:
+        raise ValueError("Конец клипа должен быть позже начала.")
+
+    seg["start"] = new_start
+    seg["end"] = new_end
+    seg["duration"] = new_end - new_start
+    seg["text"] = build_clip_text_from_range(fw_segments, new_start, new_end) or seg.get("text", "")
+
+    start_id, end_id = find_asr_ids_for_range(fw_segments, new_start, new_end)
+    if start_id is not None:
+        seg["start_id"] = start_id
+        seg["end_id"] = end_id
+
+    seg["score"] = score_topic_segment_v2(seg)
+    seg["boundaries_edited"] = True
+
+    st.session_state.topic_segments[position] = seg
+    st.session_state[f"refresh_clip_widgets_{clip_id}"] = True
+
+    clear_clip_outputs(clip_id)
+    save_json(Path(st.session_state.project_dir) / "topic_segmentation" / "topic_segments_edited.json", st.session_state.topic_segments)
+    return seg
+
+
 # =========================
 # WORKSPACE
 # =========================
@@ -395,6 +688,9 @@ def render_workspace():
     segments = st.session_state.get("topic_segments", [])
     fw_segments = st.session_state.get("fw_segments", [])
     media_duration = st.session_state.get("media_duration", 0)
+    st.session_state.setdefault("generated_srt_by_clip", {})
+    st.session_state.setdefault("exported_clip_by_clip", {})
+    st.session_state.setdefault("preview_clip_by_clip", {})
 
     if not segments:
         st.warning("Пока нет найденных клипов. Сначала запусти обработку видео.")
@@ -449,7 +745,7 @@ def render_workspace():
             height=150
         )
 
-        title_key, summary_key, text_key = ensure_clip_widget_defaults(selected_seg)
+        title_key, summary_key, text_key, start_key, end_key, range_key = ensure_clip_widget_defaults(selected_seg)
 
         st.subheader("Подробная информация о фрагменте")
 
@@ -475,6 +771,58 @@ def render_workspace():
                 f"start_id: `{selected_seg.get('start_id')}` · "
                 f"end_id: `{selected_seg.get('end_id')}`"
             )
+
+        with st.expander("Редактирование границ клипа", expanded=True):
+            max_slider_value = max(float(media_duration or 0), float(selected_seg.get("end", 0) or 0), 1.0)
+            current_start = max(0.0, min(float(selected_seg.get("start", 0) or 0), max_slider_value))
+            current_end = max(current_start + 0.1, min(float(selected_seg.get("end", current_start + 1) or current_start + 1), max_slider_value))
+
+            range_start, range_end = st.session_state.get(range_key, (current_start, current_end))
+            range_start = max(0.0, min(float(range_start), max_slider_value))
+            range_end = max(range_start + 0.1, min(float(range_end), max_slider_value))
+            st.session_state[range_key] = (range_start, range_end)
+
+            st.slider(
+                "Границы клипа, сек.",
+                min_value=0.0,
+                max_value=float(max_slider_value),
+                value=st.session_state[range_key],
+                step=1.0,
+                key=range_key
+            )
+
+            boundary_col_1, boundary_col_2 = st.columns(2)
+
+            with boundary_col_1:
+                st.text_input("Начало клипа", key=start_key, help="Например: 5:45 или 0:05:45")
+
+            with boundary_col_2:
+                st.text_input("Конец клипа", key=end_key, help="Например: 7:35 или 0:07:35")
+
+            apply_slider_col, apply_text_col = st.columns(2)
+
+            with apply_slider_col:
+                if st.button("Применить границы из ползунка", use_container_width=True):
+                    try:
+                        slider_start, slider_end = st.session_state[range_key]
+                        apply_clip_boundaries(selected_position, slider_start, slider_end, fw_segments, media_duration)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Не удалось применить границы: {e}")
+
+            with apply_text_col:
+                if st.button("Применить границы из полей", use_container_width=True):
+                    try:
+                        apply_clip_boundaries(
+                            selected_position,
+                            parse_ui_timestamp(st.session_state.get(start_key)),
+                            parse_ui_timestamp(st.session_state.get(end_key)),
+                            fw_segments,
+                            media_duration
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Не удалось применить границы: {e}")
 
         if st.button("Перегенерировать название и summary", use_container_width=True):
             current_text = st.session_state.get(text_key, selected_seg.get("text", ""))
@@ -525,6 +873,77 @@ def render_workspace():
             height=220
         )
 
+        with st.expander("Настройки предпросмотра и экспорта", expanded=False):
+            aspect_key = f"aspect_{selected_clip_id}"
+            subtitle_mode_key = f"subtitle_mode_{selected_clip_id}"
+            subtitle_position_key = f"subtitle_position_{selected_clip_id}"
+            subtitle_size_key = f"subtitle_size_{selected_clip_id}"
+
+            st.radio(
+                "Формат видео",
+                options=["Оригинальный", "Вертикальный 9:16"],
+                horizontal=True,
+                key=aspect_key
+            )
+
+            st.radio(
+                "Субтитры при экспорте",
+                options=["Не добавлять", "Отдельный SRT рядом", "Вшить в видео"],
+                horizontal=True,
+                index=1,
+                key=subtitle_mode_key
+            )
+
+            if st.session_state.get(subtitle_mode_key) == "Вшить в видео":
+                sub_col_1, sub_col_2 = st.columns(2)
+
+                with sub_col_1:
+                    st.selectbox(
+                        "Положение субтитров",
+                        options=["Снизу", "Выше снизу", "По центру"],
+                        key=subtitle_position_key
+                    )
+
+                with sub_col_2:
+                    st.slider(
+                        "Размер субтитров",
+                        min_value=16,
+                        max_value=52,
+                        value=28,
+                        step=2,
+                        key=subtitle_size_key
+                    )
+
+        def get_export_settings():
+            aspect_mode = "vertical_9_16" if st.session_state.get(f"aspect_{selected_clip_id}") == "Вертикальный 9:16" else "original"
+            subtitle_mode = st.session_state.get(f"subtitle_mode_{selected_clip_id}", "Отдельный SRT рядом")
+            subtitle_position_label = st.session_state.get(f"subtitle_position_{selected_clip_id}", "Снизу")
+            subtitle_position = {
+                "Снизу": "bottom",
+                "Выше снизу": "upper_bottom",
+                "По центру": "center",
+            }.get(subtitle_position_label, "bottom")
+            subtitle_size = int(st.session_state.get(f"subtitle_size_{selected_clip_id}", 28))
+
+            return aspect_mode, subtitle_mode, subtitle_position, subtitle_size
+
+        def ensure_srt_if_needed(seg, subtitle_mode):
+            if subtitle_mode == "Не добавлять":
+                return None
+
+            saved_srt = st.session_state.generated_srt_by_clip.get(str(selected_clip_id))
+
+            if saved_srt and Path(saved_srt).exists():
+                return Path(saved_srt)
+
+            srt_path = generate_srt_for_clip(
+                seg=seg,
+                fw_segments=fw_segments,
+                project_dir=Path(st.session_state.project_dir)
+            )
+            st.session_state.generated_srt_by_clip[str(selected_clip_id)] = str(srt_path)
+            return srt_path
+
         action_col_1, action_col_2, action_col_3, action_col_4 = st.columns(4)
 
         with action_col_1:
@@ -547,30 +966,45 @@ def render_workspace():
                 st.success(f"SRT создан: {srt_path}")
 
         with action_col_3:
-            if st.button("16:9 → 9:16", use_container_width=True):
-                st.info(
-                    "Пока это заглушка. Позже сюда можно добавить вертикальное кадрирование: "
-                    "center crop, blurred background или AI-tracking лица/объекта."
-                )
+            if st.button("Собрать предпросмотр", use_container_width=True):
+                seg = apply_widget_values_to_segment(selected_position)
+                aspect_mode, subtitle_mode, subtitle_position, subtitle_size = get_export_settings()
+
+                with st.spinner("Собираю предпросмотр клипа..."):
+                    try:
+                        srt_path = ensure_srt_if_needed(seg, subtitle_mode) if subtitle_mode == "Вшить в видео" else None
+                        preview_path = export_clip_with_optional_srt(
+                            video_path=Path(st.session_state.video_path),
+                            seg=seg,
+                            out_dir=Path(st.session_state.project_dir) / "previews",
+                            srt_path=srt_path,
+                            burn_subtitles=subtitle_mode == "Вшить в видео",
+                            aspect_mode=aspect_mode,
+                            subtitle_position=subtitle_position,
+                            subtitle_font_size=subtitle_size
+                        )
+                        st.session_state.preview_clip_by_clip[str(selected_clip_id)] = str(preview_path)
+                        st.success(f"Предпросмотр создан: {preview_path}")
+                    except Exception as e:
+                        st.error(f"Не удалось собрать предпросмотр: {e}")
 
         with action_col_4:
             if st.button("Экспортировать клип", type="primary", use_container_width=True):
                 seg = apply_widget_values_to_segment(selected_position)
-
-                srt_path: Optional[Path] = None
-                saved_srt = st.session_state.generated_srt_by_clip.get(str(selected_clip_id))
-
-                if saved_srt and Path(saved_srt).exists():
-                    srt_path = Path(saved_srt)
+                aspect_mode, subtitle_mode, subtitle_position, subtitle_size = get_export_settings()
 
                 with st.spinner("Экспортирую выбранный клип..."):
                     try:
+                        srt_path = ensure_srt_if_needed(seg, subtitle_mode)
                         clip_path = export_clip_with_optional_srt(
                             video_path=Path(st.session_state.video_path),
                             seg=seg,
                             out_dir=Path(st.session_state.project_dir) / "exports",
                             srt_path=srt_path,
-                            burn_subtitles=False
+                            burn_subtitles=subtitle_mode == "Вшить в видео",
+                            aspect_mode=aspect_mode,
+                            subtitle_position=subtitle_position,
+                            subtitle_font_size=subtitle_size
                         )
 
                         st.session_state.exported_clip_by_clip[str(selected_clip_id)] = str(clip_path)
@@ -581,6 +1015,7 @@ def render_workspace():
 
         current_srt = st.session_state.generated_srt_by_clip.get(str(selected_clip_id))
         current_export = st.session_state.exported_clip_by_clip.get(str(selected_clip_id))
+        current_preview = st.session_state.preview_clip_by_clip.get(str(selected_clip_id))
 
         if current_srt and Path(current_srt).exists():
             srt_path = Path(current_srt)
@@ -608,6 +1043,206 @@ def render_workspace():
                     use_container_width=True
                 )
 
+        elif current_preview and Path(current_preview).exists():
+            st.caption("Предпросмотр выбранного клипа")
+            st.video(str(current_preview))
+
+
+def decode_uploaded_text(uploaded_file) -> str:
+    raw = uploaded_file.getvalue()
+
+    for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return raw.decode("utf-8", errors="ignore")
+
+
+def model_segments_as_intervals():
+    intervals = []
+
+    for seg in st.session_state.get("topic_segments", []) or []:
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end", start) or start)
+
+        if end <= start:
+            continue
+
+        intervals.append({
+            "start": start,
+            "end": end,
+            "label": seg.get("title") or f"Клип {seg.get('id', len(intervals) + 1)}",
+            "source": "model",
+        })
+
+    return sorted(intervals, key=lambda item: item["start"])
+
+
+def format_interval_for_option(index: int, intervals: list, source_label: str) -> str:
+    if intervals:
+        first = intervals[0]
+        last = intervals[-1]
+        return (
+            f"{source_label}: {len(intervals)} сегм. "
+            f"({format_eval_timestamp(first['start'])}-{format_eval_timestamp(last['end'])})"
+        )
+
+    return f"{source_label}: 0 сегм."
+
+
+def render_timestamp_evaluation():
+    with st.expander("Оценка таймингов / F1-score", expanded=False):
+        st.caption(
+            "Загрузите или вставьте тайминги, выберите эталон и сравниваемый блок. "
+            "Сегмент считается найденным, если IoU по времени выше заданного порога."
+        )
+
+        uploaded_timestamps = st.file_uploader(
+            "Файл с таймингами (.txt)",
+            type=["txt"],
+            key="timestamps_eval_file"
+        )
+
+        if uploaded_timestamps is not None:
+            file_signature = f"{uploaded_timestamps.name}:{uploaded_timestamps.size}"
+
+            if st.session_state.get("timestamps_eval_file_signature") != file_signature:
+                st.session_state.timestamps_eval_text = decode_uploaded_text(uploaded_timestamps)
+                st.session_state.timestamps_eval_file_signature = file_signature
+
+        st.text_area(
+            "Тайминги",
+            key="timestamps_eval_text",
+            height=220,
+            placeholder=(
+                "00:00 - 00:46 Вступление\n"
+                "00:47 - 03:30 Ультрадиффузные галактики\n\n"
+                "00:00 - Начало\n00:46 - Следующая тема"
+            )
+        )
+
+        timing_text = st.session_state.get("timestamps_eval_text", "")
+        model_intervals = model_segments_as_intervals()
+
+        try:
+            blocks = parse_timestamp_blocks(timing_text) if timing_text.strip() else []
+        except Exception as e:
+            st.error(f"Не удалось разобрать тайминги: {e}")
+            return
+
+        inferred_duration = infer_duration(blocks) if blocks else None
+        default_duration = float(st.session_state.get("media_duration") or inferred_duration or 0)
+
+        duration_value = st.text_input(
+            "Длительность видео для последнего маркера без конца",
+            value=format_eval_timestamp(default_duration) if default_duration > 0 else "",
+            help="Нужно для блоков вида `19:27 - Завершение`, где нет конечного таймкода."
+        )
+
+        try:
+            fallback_duration = parse_eval_timestamp(duration_value) if duration_value.strip() else inferred_duration
+        except Exception as e:
+            st.error(f"Некорректная длительность видео: {e}")
+            return
+
+        sources = []
+
+        for index, block in enumerate(blocks):
+            intervals = block_to_intervals(block, fallback_duration=fallback_duration)
+            sources.append({
+                "label": format_interval_for_option(index, intervals, f"Блок {index}"),
+                "intervals": intervals,
+                "kind": "text",
+                "index": index,
+            })
+
+        if model_intervals:
+            sources.append({
+                "label": format_interval_for_option(len(sources), model_intervals, "Текущие сегменты модели"),
+                "intervals": model_intervals,
+                "kind": "model",
+                "index": None,
+            })
+
+        if not sources:
+            st.info("Добавьте тайминги или сначала выполните ИИ-сегментацию видео.")
+            return
+
+        if len(sources) < 2:
+            st.info("Для F1 нужны минимум два набора интервалов: эталон и сравниваемые тайминги.")
+            return
+
+        option_labels = [source["label"] for source in sources]
+        default_prediction_index = len(sources) - 1
+
+        eval_col_1, eval_col_2, eval_col_3 = st.columns([0.38, 0.38, 0.24])
+
+        with eval_col_1:
+            reference_label = st.selectbox("Эталон", option_labels, index=0)
+
+        with eval_col_2:
+            prediction_label = st.selectbox("Сравниваем", option_labels, index=default_prediction_index)
+
+        with eval_col_3:
+            iou_threshold = st.slider("IoU", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
+
+        reference = sources[option_labels.index(reference_label)]["intervals"]
+        prediction = sources[option_labels.index(prediction_label)]["intervals"]
+
+        if st.button("Посчитать F1", type="primary", use_container_width=True):
+            result = evaluate_segments(reference, prediction, iou_threshold=iou_threshold)
+
+            metric_col_1, metric_col_2, metric_col_3, metric_col_4, metric_col_5, metric_col_6 = st.columns(6)
+            metric_col_1.metric("TP", result["tp"])
+            metric_col_2.metric("FP", result["fp"])
+            metric_col_3.metric("FN", result["fn"])
+            metric_col_4.metric("Precision", f"{result['precision']:.3f}")
+            metric_col_5.metric("Recall", f"{result['recall']:.3f}")
+            metric_col_6.metric("F1", f"{result['f1']:.3f}")
+
+            matched_prediction_ids = {id(match["prediction"]) for match in result["matches"]}
+            matched_reference_ids = {id(match["reference"]) for match in result["matches"]}
+
+            match_rows = []
+            for match in result["matches"]:
+                pred = match["prediction"]
+                ref = match["reference"]
+                match_rows.append({
+                    "IoU": round(match["iou"], 3),
+                    "prediction": f"{format_eval_timestamp(pred['start'])}-{format_eval_timestamp(pred['end'])} {pred.get('label', '')}",
+                    "reference": f"{format_eval_timestamp(ref['start'])}-{format_eval_timestamp(ref['end'])} {ref.get('label', '')}",
+                })
+
+            if match_rows:
+                st.write("Совпавшие сегменты")
+                st.dataframe(match_rows, use_container_width=True, hide_index=True)
+
+            false_positive_rows = [
+                {
+                    "prediction": f"{format_eval_timestamp(item['start'])}-{format_eval_timestamp(item['end'])} {item.get('label', '')}"
+                }
+                for item in prediction
+                if id(item) not in matched_prediction_ids
+            ]
+
+            false_negative_rows = [
+                {
+                    "reference": f"{format_eval_timestamp(item['start'])}-{format_eval_timestamp(item['end'])} {item.get('label', '')}"
+                }
+                for item in reference
+                if id(item) not in matched_reference_ids
+            ]
+
+            if false_positive_rows:
+                st.write("FP: лишние сегменты")
+                st.dataframe(false_positive_rows, use_container_width=True, hide_index=True)
+
+            if false_negative_rows:
+                st.write("FN: пропущенные сегменты")
+                st.dataframe(false_negative_rows, use_container_width=True, hide_index=True)
+
 
 # =========================
 # MAIN UI
@@ -620,35 +1255,119 @@ st.caption(
     "редактирование карточки → генерация субтитров → экспорт выбранного клипа."
 )
 
-upload_col, future_col = st.columns([0.58, 0.42], gap="large")
+with st.expander("Настройки ускорения", expanded=False):
+    st.write(
+        f"**ASR:** faster-whisper `{FASTER_WHISPER_MODEL}`, устройство `{ASR_DEVICE}`, "
+        f"GPU batch `{FW_GPU_BATCH_SIZE}`"
+    )
+    st.write(
+        f"**GPT4All:** устройство `{GPT4ALL_DEVICE}` · "
+        f"окно сегментации `{TOPIC_MAX_SEGMENTS_PER_WINDOW}` сегм., overlap `{TOPIC_OVERLAP_SEGMENTS}`"
+    )
+    st.write(f"**Экспорт:** NVENC {'включён' if USE_NVENC_FOR_EXPORT else 'выключен'} с fallback на libx264")
+    st.caption(
+        "Эти значения можно менять через переменные окружения без правки кода: "
+        "ASR_DEVICE, FW_GPU_BATCH_SIZE, GPT4ALL_DEVICE, USE_NVENC_FOR_EXPORT."
+    )
 
-with upload_col:
+topic_mode_label = st.radio(
+    "Режим ИИ-сегментации",
+    options=["Быстрый", "Качественный"],
+    index=0,
+    horizontal=True,
+    help=(
+        "Быстрый режим просит GPT4All только найти границы подтем, без title/summary для каждого окна. "
+        "Качественный режим генерирует title и summary сразу, но работает заметно дольше."
+    )
+)
+
+selected_topic_mode = "fast" if topic_mode_label == "Быстрый" else "quality"
+generate_topic_metadata = st.checkbox(
+    "Генерировать title/summary сразу",
+    value=False,
+    help="Если выключено, GPT4All ищет только границы подтем. Название и summary можно сгенерировать позже для выбранного клипа."
+)
+
+mode_changed = st.session_state.get("topic_mode") and st.session_state.topic_mode != selected_topic_mode
+metadata_changed = (
+    "generate_topic_metadata" in st.session_state
+    and st.session_state.generate_topic_metadata != generate_topic_metadata
+)
+
+if mode_changed or metadata_changed:
+    for key in ["topic_segments", "selected_position", "generated_srt_by_clip", "exported_clip_by_clip", "preview_clip_by_clip"]:
+        st.session_state.pop(key, None)
+
+st.session_state.topic_mode = selected_topic_mode
+st.session_state.generate_topic_metadata = generate_topic_metadata
+
+if selected_topic_mode == "fast":
+    st.caption(
+        f"Быстрый режим: окно `{TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW}` ASR-сегм., "
+        f"overlap `{TOPIC_FAST_OVERLAP_SEGMENTS}`, max tokens `{GPT4ALL_FAST_TOPIC_MAX_TOKENS}`. "
+        "Если title/summary не генерируются сразу, их можно сделать для выбранного клипа."
+    )
+else:
+    st.caption(
+        f"Качественный режим: окно `{TOPIC_MAX_SEGMENTS_PER_WINDOW}` ASR-сегм., "
+        f"overlap `{TOPIC_OVERLAP_SEGMENTS}`, max tokens `{GPT4ALL_TOPIC_MAX_TOKENS}`."
+    )
+
+source_mode = st.radio(
+    "Источник видео",
+    options=["Локальный файл", "Путь к файлу", "YouTube / VK"],
+    horizontal=True
+)
+
+if source_mode == "Локальный файл":
     uploaded_video = st.file_uploader(
         "Загрузите видеофайл",
-        type=["mp4", "mov", "mkv", "avi", "webm"],
+        type=["mp4", "mov", "mkv", "avi", "webm", "m4v"],
         accept_multiple_files=False
     )
 
-with future_col:
-    st.text_input(
-        "Загрузка по ссылке",
-        placeholder="VK / RuTube / YouTube — будет добавлено позже",
-        disabled=True
+    if uploaded_video is not None:
+        save_uploaded_video(uploaded_video)
+
+elif source_mode == "Путь к файлу":
+    local_path = st.text_input(
+        "Путь к видеофайлу",
+        placeholder="C:\\Videos\\example.mp4"
     )
 
     st.caption(
-        "Сейчас работает загрузка локального файла. "
-        "Поддержку ссылок лучше добавить отдельным модулем загрузки."
+        "Для больших локальных файлов это лучше, чем загрузка через браузер: "
+        "файл не копируется в outputs и не ограничивается upload-лимитом."
     )
 
-if uploaded_video is not None:
-    save_uploaded_video(uploaded_video)
+    if st.button("Выбрать файл", type="primary", use_container_width=True):
+        select_video_from_local_path(local_path)
+
+else:
+    video_url = st.text_input(
+        "Ссылка на публичное видео",
+        placeholder="https://www.youtube.com/watch?v=... или https://vk.com/video..."
+    )
+
+    st.caption(
+        "Поддерживаются публичные видео YouTube, YouTube Shorts, VK и VK Video. "
+        "Закрытые видео и авторизация пока не используются."
+    )
+
+    if st.button("Скачать видео", type="primary", use_container_width=True):
+        download_video_from_link(video_url)
 
 if st.session_state.get("video_path"):
     video_path = Path(st.session_state.video_path)
     project_dir = Path(st.session_state.project_dir)
 
     st.success(f"Видео загружено: {video_path.name}")
+
+    if st.session_state.get("source_url"):
+        st.caption(f"Источник: {st.session_state.source_url}")
+
+    if st.session_state.get("source_path"):
+        st.caption(f"Локальный путь: {st.session_state.source_path}")
 
     with st.expander("Предпросмотр исходного видео", expanded=False):
         st.video(str(video_path))
@@ -671,6 +1390,8 @@ if st.session_state.get("video_path"):
             "Сохраняются только промежуточные данные анализа. "
             "MP4-файл выбранного клипа создается только после нажатия кнопки «Экспортировать клип»."
         )
+
+render_timestamp_evaluation()
 
 if st.session_state.get("topic_segments"):
     render_workspace()

@@ -8,6 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 # =========================
 # OPTIONAL IMPORTS
@@ -19,39 +20,102 @@ except ImportError:
     psutil = None
 
 try:
-    from faster_whisper import WhisperModel
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
 except ImportError:
     WhisperModel = None
+    BatchedInferencePipeline = None
 
 try:
     from gpt4all import GPT4All
 except ImportError:
     GPT4All = None
 
+try:
+    from yt_dlp import YoutubeDL
+except ImportError:
+    YoutubeDL = None
+
 
 # =========================
 # CONFIG
 # =========================
 
-VIDEO_PATH = "data/sample.mp4"
+def get_env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on", "да"}
 
-OUTPUT_DIR = Path("outputs")
+
+def get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+VIDEO_PATH = os.getenv("VIDEO_PATH", "data/sample.mp4")
+
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-FASTER_WHISPER_MODEL = "medium"
-USE_CUDA_FOR_WHISPER = False
-GPT4ALL_MODEL_PATH = "C:/vs/Practice/models/mistral-7b-instruct-v0.1.Q4_0.gguf"
+FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "medium")
+GPT4ALL_MODEL_PATH = os.getenv(
+    "GPT4ALL_MODEL_PATH",
+    "C:/vs/Practice/models/mistral-7b-instruct-v0.1.Q4_0.gguf"
+)
 
-FFMPEG_BIN = "ffmpeg"
-FFPROBE_BIN = "ffprobe"
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
 
-LANGUAGE = "ru"
+LANGUAGE = os.getenv("LANGUAGE", "ru")
 
-# CUDA для faster-whisper отключена принудительно, чтобы не требовался cublas64_12.dll.
-USE_CUDA_FOR_ASR = False
+# ASR_DEVICE:
+# - auto: попробовать CUDA, если видна NVIDIA GPU; при ошибке откатиться на CPU;
+# - cuda: принудительно попробовать CUDA;
+# - cpu: всегда CPU, удобно для ноутбука без NVIDIA/CUDA.
+ASR_DEVICE = os.getenv("ASR_DEVICE", "auto").strip().lower()
 
-# NVENC временно отключен для стабильности. Экспорт идёт через libx264.
-USE_NVENC_FOR_EXPORT = False
+# Обратная совместимость со старой переменной.
+if "USE_CUDA_FOR_ASR" in os.environ:
+    ASR_DEVICE = "cuda" if get_env_bool("USE_CUDA_FOR_ASR", False) else "cpu"
+
+FW_CUDA_COMPUTE_TYPE = os.getenv("FW_CUDA_COMPUTE_TYPE", "float16")
+FW_CPU_COMPUTE_TYPE = os.getenv("FW_CPU_COMPUTE_TYPE", "int8")
+FW_GPU_BATCH_SIZE = get_env_int("FW_GPU_BATCH_SIZE", 8)
+FW_CPU_BATCH_SIZE = get_env_int("FW_CPU_BATCH_SIZE", 1)
+FW_BEAM_SIZE = get_env_int("FW_BEAM_SIZE", 5)
+FW_VAD_FILTER = get_env_bool("FW_VAD_FILTER", True)
+ENABLE_ASR_CACHE = get_env_bool("ENABLE_ASR_CACHE", True)
+
+# GPT4All на Windows часто стабильнее на CPU. При желании можно поставить cuda/nvidia/kompute.
+GPT4ALL_DEVICE = os.getenv("GPT4ALL_DEVICE", "cpu").strip().lower()
+GPT4ALL_THREADS = get_env_int("GPT4ALL_THREADS", 0)
+GPT4ALL_TOPIC_MAX_TOKENS = get_env_int("GPT4ALL_TOPIC_MAX_TOKENS", 220)
+GPT4ALL_FAST_TOPIC_MAX_TOKENS = get_env_int("GPT4ALL_FAST_TOPIC_MAX_TOKENS", 90)
+TOPIC_MAX_SEGMENTS_PER_WINDOW = get_env_int("TOPIC_MAX_SEGMENTS_PER_WINDOW", 12)
+TOPIC_OVERLAP_SEGMENTS = get_env_int("TOPIC_OVERLAP_SEGMENTS", 2)
+TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW = get_env_int("TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW", 24)
+TOPIC_FAST_OVERLAP_SEGMENTS = get_env_int("TOPIC_FAST_OVERLAP_SEGMENTS", 0)
+
+# Экспорт клипов. Если NVENC недоступен, код автоматически откатится на libx264.
+USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
+
+# EXPORT_MODE=reencode — точное перекодирование; EXPORT_MODE=copy — максимально быстрый экспорт без перекодирования,
+# но рез может попасть не точно в кадр, если start не на keyframe.
+EXPORT_MODE = os.getenv("EXPORT_MODE", "reencode").strip().lower()
+
+LAST_ASR_RUNTIME: Dict[str, str] = {}
+
+SUPPORTED_VIDEO_HOSTS = {
+    "youtube.com",
+    "youtu.be",
+    "vk.com",
+    "vkvideo.ru",
+}
 
 
 # =========================
@@ -60,13 +124,22 @@ USE_NVENC_FOR_EXPORT = False
 
 def run_cmd(cmd: List[str], capture_output: bool = True) -> Tuple[int, str, str, float]:
     start = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        capture_output=capture_output,
-        text=True,
-        encoding="utf-8",
-        errors="ignore"
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=capture_output,
+            text=True,
+            encoding="utf-8",
+            errors="ignore"
+        )
+    except FileNotFoundError as e:
+        executable = cmd[0] if cmd else "unknown"
+        raise RuntimeError(
+            f"Не найден исполняемый файл `{executable}`. "
+            "Установите FFmpeg/ffprobe или задайте переменные FFMPEG_BIN и FFPROBE_BIN. "
+            "Если PATH был изменен недавно, перезапустите терминал и Streamlit."
+        ) from e
+
     elapsed = time.perf_counter() - start
     return proc.returncode, proc.stdout, proc.stderr, elapsed
 
@@ -170,6 +243,134 @@ def safe_filename(name: str, max_len: int = 90) -> str:
     return (name[:max_len] or "file").strip("_")
 
 
+def is_supported_video_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    host = (parsed.hostname or "").lower()
+
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host in SUPPORTED_VIDEO_HOSTS:
+        return True
+
+    return any(
+        host.endswith(f".{base_host}")
+        for base_host in SUPPORTED_VIDEO_HOSTS
+        if base_host != "youtu.be"
+    )
+
+
+def download_video_from_url(
+    url: str,
+    out_dir: Path,
+    progress_callback=None
+) -> Path:
+    """Скачивает публичное видео YouTube/VK через yt-dlp и возвращает путь к локальному файлу."""
+    url = str(url or "").strip()
+
+    if not is_supported_video_url(url):
+        raise ValueError("Поддерживаются только публичные ссылки YouTube, YouTube Shorts, VK и VK Video.")
+
+    if YoutubeDL is None:
+        raise RuntimeError("yt-dlp не установлен. Обновите зависимости: pip install -r requirements.txt")
+
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    before_files = {p.resolve() for p in out_dir.iterdir() if p.is_file()}
+    download_token = int(time.time())
+    outtmpl = str(out_dir / f"{download_token}_%(extractor_key)s_%(id)s.%(ext)s")
+
+    def ytdlp_progress_hook(status: Dict):
+        if progress_callback is None:
+            return
+
+        status_name = status.get("status")
+
+        if status_name == "downloading":
+            total = status.get("total_bytes") or status.get("total_bytes_estimate") or 0
+            downloaded = status.get("downloaded_bytes") or 0
+
+            if total > 0:
+                progress = min(downloaded / total, 0.95)
+                progress_callback(progress, f"Скачиваю видео: {progress * 100:.1f}%")
+            else:
+                progress_callback(0.10, "Скачиваю видео...")
+
+        elif status_name == "finished":
+            progress_callback(0.96, "Скачивание завершено, подготавливаю MP4...")
+
+    ydl_opts = {
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [ytdlp_progress_hook],
+        "restrictfilenames": True,
+    }
+
+    if progress_callback:
+        progress_callback(0.02, "Получаю информацию о видео...")
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        candidate_paths: List[Path] = []
+
+        for item in info.get("requested_downloads") or []:
+            item_path = item.get("filepath") or item.get("_filename")
+            if item_path:
+                candidate_paths.append(Path(item_path))
+
+        prepared_path = Path(ydl.prepare_filename(info))
+        candidate_paths.append(prepared_path)
+        candidate_paths.append(prepared_path.with_suffix(".mp4"))
+
+    video_extensions = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+    new_video_files = [
+        p
+        for p in out_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in video_extensions
+        and p.resolve() not in before_files
+    ]
+
+    candidate_paths.extend(new_video_files)
+
+    existing_candidates = [
+        p
+        for p in candidate_paths
+        if p.exists() and p.is_file() and p.suffix.lower() in video_extensions and p.stat().st_size > 0
+    ]
+
+    if not existing_candidates:
+        raise RuntimeError("yt-dlp завершился, но итоговый видеофайл не найден.")
+
+    video_path = max(existing_candidates, key=lambda p: p.stat().st_mtime)
+
+    save_json(
+        video_path.with_suffix(".source.json"),
+        {
+            "source_url": url,
+            "title": info.get("title"),
+            "extractor": info.get("extractor"),
+            "extractor_key": info.get("extractor_key"),
+            "webpage_url": info.get("webpage_url"),
+            "duration": info.get("duration"),
+            "downloaded_path": str(video_path),
+        }
+    )
+
+    if progress_callback:
+        progress_callback(1.0, "Видео скачано.")
+
+    return video_path
+
+
 def get_system_usage_snapshot() -> Dict:
     snapshot = {}
 
@@ -221,23 +422,143 @@ def get_nvidia_gpu_snapshot() -> Dict:
 # ASR
 # =========================
 
-def load_faster_whisper_model():
-    """
-    Загружает faster-whisper строго на CPU.
+def has_nvidia_gpu() -> bool:
+    """Быстрая проверка: видит ли система NVIDIA GPU через nvidia-smi."""
+    try:
+        code, out, _, _ = run_cmd(["nvidia-smi", "-L"])
+        return code == 0 and "GPU" in out
+    except Exception:
+        return False
 
-    В этой версии CUDA специально отключена, чтобы приложение не падало
-    на Windows с ошибкой cublas64_12.dll. GPU можно будет включить позже,
-    когда будут установлены CUDA/cuBLAS/cuDNN.
+
+def resolve_asr_device() -> str:
+    """Возвращает целевое устройство для faster-whisper: cuda или cpu."""
+    if ASR_DEVICE == "cpu":
+        return "cpu"
+
+    if ASR_DEVICE == "cuda":
+        return "cuda"
+
+    if ASR_DEVICE == "auto" and has_nvidia_gpu():
+        return "cuda"
+
+    return "cpu"
+
+
+def load_faster_whisper_model(preferred_device: Optional[str] = None):
+    """
+    Загружает faster-whisper с автоматическим выбором CUDA/CPU.
+
+    На мощном ПК с NVIDIA сначала пробуем CUDA. Если не хватает CUDA/cuBLAS/cuDNN
+    или возникает ошибка загрузки, автоматически откатываемся на CPU int8, чтобы
+    приложение не падало на ноутбуке или неподготовленной системе.
     """
     if WhisperModel is None:
         raise RuntimeError("faster-whisper не установлен")
 
-    print("[INFO] Loading faster-whisper on CPU int8... CUDA is disabled in code.")
-    return WhisperModel(
-        FASTER_WHISPER_MODEL,
-        device="cpu",
-        compute_type="int8"
+    target_device = (preferred_device or resolve_asr_device()).strip().lower()
+
+    candidates = []
+    if target_device == "cuda":
+        candidates.append(("cuda", FW_CUDA_COMPUTE_TYPE))
+
+    # CPU fallback всегда оставляем последним вариантом.
+    candidates.append(("cpu", FW_CPU_COMPUTE_TYPE))
+
+    last_error = None
+
+    for device, compute_type in candidates:
+        try:
+            print(
+                f"[INFO] Loading faster-whisper model={FASTER_WHISPER_MODEL} "
+                f"device={device} compute_type={compute_type}"
+            )
+            model = WhisperModel(
+                FASTER_WHISPER_MODEL,
+                device=device,
+                compute_type=compute_type
+            )
+            LAST_ASR_RUNTIME.clear()
+            LAST_ASR_RUNTIME.update({
+                "device": device,
+                "compute_type": compute_type,
+                "model": FASTER_WHISPER_MODEL,
+            })
+            return model
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] faster-whisper failed on {device}/{compute_type}: {e}")
+
+    raise RuntimeError(f"Не удалось загрузить faster-whisper ни на CUDA, ни на CPU: {last_error}")
+
+
+def run_faster_whisper_transcribe(model, wav_path: Path):
+    """
+    Запускает обычную или batched-транскрибацию в зависимости от устройства.
+
+    Важно: в новых версиях faster-whisper BatchedInferencePipeline требует
+    либо vad_filter=True, либо clip_timestamps. Без этого появляется ошибка:
+    "No clip timestamps found. Set 'vad_filter' to True or provide 'clip_timestamps'."
+
+    Поэтому для batched-режима VAD включается принудительно. Если batched-режим
+    всё равно падает не из-за CUDA, код откатывается на обычный transcribe()
+    на том же устройстве, чтобы обработка не прерывалась.
+    """
+    device = LAST_ASR_RUNTIME.get("device", "cpu")
+    batch_size = FW_GPU_BATCH_SIZE if device == "cuda" else FW_CPU_BATCH_SIZE
+
+    base_kwargs = {
+        "language": LANGUAGE,
+        "beam_size": FW_BEAM_SIZE,
+        "vad_filter": FW_VAD_FILTER,
+    }
+
+    if batch_size > 1 and BatchedInferencePipeline is not None:
+        print(f"[INFO] Using faster-whisper batched inference, batch_size={batch_size}")
+        batched_model = BatchedInferencePipeline(model=model)
+
+        batched_kwargs = dict(base_kwargs)
+        batched_kwargs["vad_filter"] = True
+        batched_kwargs.setdefault("vad_parameters", {"min_silence_duration_ms": 500})
+
+        try:
+            return batched_model.transcribe(
+                str(wav_path),
+                batch_size=batch_size,
+                **batched_kwargs
+            )
+        except Exception as e:
+            error_text = str(e).lower()
+
+            # Ошибки CUDA пусть обработает внешний fallback на CPU.
+            if any(token in error_text for token in ("cuda", "cublas", "cudnn", "out of memory", "cublas64")):
+                raise
+
+            print(f"[WARN] Batched faster-whisper failed: {e}")
+            print("[INFO] Retrying faster-whisper without batched inference on the same device...")
+            return model.transcribe(str(wav_path), **base_kwargs)
+
+    if batch_size > 1 and BatchedInferencePipeline is None:
+        print("[WARN] BatchedInferencePipeline недоступен в установленной версии faster-whisper. Использую обычный режим.")
+
+    return model.transcribe(str(wav_path), **base_kwargs)
+
+
+def is_cuda_runtime_error(error: Exception) -> bool:
+    """Проверяет, относится ли ошибка к CUDA/cuBLAS/cuDNN/VRAM."""
+    error_text = str(error).lower()
+    cuda_markers = (
+        "cuda",
+        "cublas",
+        "cudnn",
+        "cublas64",
+        "cudnn_ops",
+        "cudnn_cnn",
+        "out of memory",
+        "no kernel image",
+        "driver version",
     )
+    return any(marker in error_text for marker in cuda_markers)
 
 
 def transcribe_with_faster_whisper(
@@ -251,6 +572,12 @@ def transcribe_with_faster_whisper(
       {"start": 0.0, "end": 3.2, "text": "..."},
       ...
     ]
+
+    Важный момент: faster-whisper возвращает ленивый генератор сегментов.
+    Поэтому часть CUDA-ошибок, например отсутствие cublas64_12.dll, возникает
+    не в момент вызова model.transcribe(), а позже — при проходе по segments_iter.
+    Из-за этого весь проход по сегментам специально находится внутри try/except.
+    Если CUDA падает, код повторяет распознавание на CPU int8 вместо падения UI.
     """
     out_dir.mkdir(exist_ok=True, parents=True)
 
@@ -262,81 +589,91 @@ def transcribe_with_faster_whisper(
     segments_json_path = out_dir / "faster_whisper_segments.json"
     srt_path = out_dir / "faster_whisper.srt"
 
+    if ENABLE_ASR_CACHE and segments_json_path.exists():
+        cached_segments = read_json_if_exists(str(segments_json_path))
+        if isinstance(cached_segments, list) and cached_segments:
+            print(f"[INFO] Reusing cached ASR segments: {segments_json_path}")
+            if progress_callback:
+                progress_callback(0.65, "Использую кэш распознавания речи...")
+            return cached_segments
+
     if progress_callback:
         progress_callback(0.08, "Извлекаю аудио из видео...")
 
     extract_audio_wav(str(video_path), str(wav_path), sr=16000)
 
-    if progress_callback:
-        progress_callback(0.15, "Загружаю faster-whisper...")
+    def run_and_collect(preferred_device: Optional[str] = None) -> Tuple[List[str], List[str], List[Dict], List[str]]:
+        if progress_callback:
+            device_label = preferred_device or resolve_asr_device()
+            progress_callback(0.15, f"Загружаю faster-whisper ({device_label})...")
 
-    model = load_faster_whisper_model()
+        model = load_faster_whisper_model(preferred_device=preferred_device)
 
-    if progress_callback:
-        progress_callback(0.22, "Распознаю речь...")
+        if progress_callback:
+            runtime_device = LAST_ASR_RUNTIME.get("device", preferred_device or "auto")
+            progress_callback(0.22, f"Распознаю речь ({runtime_device})...")
+
+        segments_iter, _info = run_faster_whisper_transcribe(model, wav_path)
+
+        transcript_parts: List[str] = []
+        timed_lines: List[str] = []
+        segments_json: List[Dict] = []
+        srt_blocks: List[str] = []
+
+        # Ошибки CUDA/cuBLAS/cuDNN могут возникнуть именно здесь, потому что
+        # segments_iter — ленивый генератор.
+        for _idx, seg in enumerate(segments_iter, start=1):
+            seg_start = float(seg.start)
+            seg_end = float(seg.end)
+            seg_text = seg.text.strip()
+
+            if not seg_text:
+                continue
+
+            transcript_parts.append(seg_text)
+
+            timed_lines.append(
+                f"{format_timestamp(seg_start)} - {format_timestamp(seg_end)} {seg_text}"
+            )
+
+            segments_json.append({
+                "start": seg_start,
+                "end": seg_end,
+                "text": seg_text
+            })
+
+            srt_blocks.append(
+                f"{len(srt_blocks) + 1}\n"
+                f"{format_srt_timestamp(seg_start)} --> {format_srt_timestamp(seg_end)}\n"
+                f"{seg_text}\n"
+            )
+
+            if progress_callback and media_duration > 0:
+                local = min(seg_end / media_duration, 1.0)
+                runtime_device = LAST_ASR_RUNTIME.get("device", "unknown")
+                progress_callback(
+                    0.22 + local * 0.43,
+                    f"Распознаю речь ({runtime_device}): {format_timestamp(seg_end)} / {format_timestamp(media_duration)}"
+                )
+
+        return transcript_parts, timed_lines, segments_json, srt_blocks
 
     try:
-        segments_iter, _info = model.transcribe(
-            str(wav_path),
-            language=LANGUAGE
-        )
+        transcript_parts, timed_lines, segments_json, srt_blocks = run_and_collect()
     except Exception as e:
-        error_text = str(e).lower()
-
-        if "cuda" in error_text or "cublas" in error_text or "cudnn" in error_text:
-            print(f"[WARN] faster-whisper CUDA failed during transcription: {e}")
+        if is_cuda_runtime_error(e):
+            print(f"[WARN] faster-whisper CUDA failed during transcription/iteration: {e}")
             print("[INFO] Retrying faster-whisper on CPU int8...")
 
-            model = WhisperModel(
-                FASTER_WHISPER_MODEL,
-                device="cpu",
-                compute_type="int8"
-            )
+            if progress_callback:
+                progress_callback(
+                    0.20,
+                    "CUDA-библиотеки не найдены или CUDA упала. Переключаюсь на CPU int8..."
+                )
 
-            segments_iter, _info = model.transcribe(
-                str(wav_path),
-                language=LANGUAGE
-            )
+            transcript_parts, timed_lines, segments_json, srt_blocks = run_and_collect(preferred_device="cpu")
         else:
             raise
-
-    transcript_parts = []
-    timed_lines = []
-    segments_json = []
-    srt_blocks = []
-
-    for idx, seg in enumerate(segments_iter, start=1):
-        seg_start = float(seg.start)
-        seg_end = float(seg.end)
-        seg_text = seg.text.strip()
-
-        if not seg_text:
-            continue
-
-        transcript_parts.append(seg_text)
-
-        timed_lines.append(
-            f"{format_timestamp(seg_start)} - {format_timestamp(seg_end)} {seg_text}"
-        )
-
-        segments_json.append({
-            "start": seg_start,
-            "end": seg_end,
-            "text": seg_text
-        })
-
-        srt_blocks.append(
-            f"{idx}\n"
-            f"{format_srt_timestamp(seg_start)} --> {format_srt_timestamp(seg_end)}\n"
-            f"{seg_text}\n"
-        )
-
-        if progress_callback and media_duration > 0:
-            local = min(seg_end / media_duration, 1.0)
-            progress_callback(
-                0.22 + local * 0.43,
-                f"Распознаю речь: {format_timestamp(seg_end)} / {format_timestamp(media_duration)}"
-            )
 
     txt_path.write_text(" ".join(transcript_parts).strip(), encoding="utf-8")
     timed_txt_path.write_text("\n".join(timed_lines), encoding="utf-8")
@@ -344,7 +681,6 @@ def transcribe_with_faster_whisper(
     save_json(segments_json_path, segments_json)
 
     return segments_json
-
 
 # =========================
 # GPT4ALL
@@ -362,34 +698,40 @@ def load_gpt4all_model(n_ctx: int = 4096):
     if not Path(GPT4ALL_MODEL_PATH).exists():
         raise RuntimeError(f"Модель GPT4All не найдена: {GPT4ALL_MODEL_PATH}")
 
-    attempts = [
-        {
-            "model_name": GPT4ALL_MODEL_PATH,
-            "allow_download": False,
-            "device": "cpu",
-            "n_ctx": n_ctx
-        },
-        {
-            "model_name": GPT4ALL_MODEL_PATH,
-            "allow_download": False,
-            "device": "cpu"
-        },
-        {
-            "model_name": GPT4ALL_MODEL_PATH,
-            "allow_download": False
-        }
-    ]
+    base_kwargs = {
+        "model_name": GPT4ALL_MODEL_PATH,
+        "allow_download": False,
+        "n_ctx": n_ctx,
+    }
+
+    if GPT4ALL_THREADS > 0:
+        base_kwargs["n_threads"] = GPT4ALL_THREADS
+
+    attempts = []
+
+    if GPT4ALL_DEVICE and GPT4ALL_DEVICE not in {"auto", "none"}:
+        attempts.append({**base_kwargs, "device": GPT4ALL_DEVICE})
+
+    # CPU fallback — самый стабильный вариант на Windows.
+    attempts.append({**base_kwargs, "device": "cpu"})
+    attempts.append({"model_name": GPT4ALL_MODEL_PATH, "allow_download": False, "device": "cpu"})
+    attempts.append({"model_name": GPT4ALL_MODEL_PATH, "allow_download": False})
 
     last_error = None
 
     for kwargs in attempts:
         try:
+            print(f"[INFO] Loading GPT4All device={kwargs.get('device', 'default')} n_ctx={kwargs.get('n_ctx', 'default')}")
             return GPT4All(**kwargs)
         except TypeError as e:
             last_error = e
             continue
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] GPT4All load failed with {kwargs.get('device', 'default')}: {e}")
+            continue
 
-    raise last_error
+    raise RuntimeError(f"Не удалось загрузить GPT4All: {last_error}")
 
 
 def extract_json_from_model_answer(answer: str):
@@ -556,7 +898,12 @@ def split_segments_for_llm_by_count(
     return windows
 
 
-def ask_gpt4all_for_topics_in_window(model, window_segments: List[Dict]) -> List[Dict]:
+def ask_gpt4all_for_topics_in_window(
+    model,
+    window_segments: List[Dict],
+    include_metadata: bool = True,
+    max_tokens: Optional[int] = None
+) -> List[Dict]:
     """
     Просит GPT4All выделить подтемы внутри маленького окна ASR-сегментов.
     Prompt короткий, чтобы помещаться даже в context window 2048.
@@ -566,7 +913,8 @@ def ask_gpt4all_for_topics_in_window(model, window_segments: List[Dict]) -> List
     first_id = int(window_segments[0]["id"])
     last_id = int(window_segments[-1]["id"])
 
-    prompt = f"""
+    if include_metadata:
+        prompt = f"""
 Раздели ASR-сегменты видео на смысловые подтемы.
 
 Правила:
@@ -582,10 +930,29 @@ def ask_gpt4all_for_topics_in_window(model, window_segments: List[Dict]) -> List
 Сегменты:
 {segments_text}
 """.strip()
+    else:
+        prompt = f"""
+Раздели ASR-сегменты видео на смысловые подтемы.
+
+Правила:
+- новая подтема = новая мысль, пример, вопрос, проблема, решение или вывод;
+- start_id и end_id бери только из списка;
+- end_id включается;
+- не пиши title и summary;
+- ответ только JSON.
+
+Формат:
+{{"topics":[{{"start_id":{first_id},"end_id":{last_id}}}]}}
+
+Сегменты:
+{segments_text}
+""".strip()
+
+    token_limit = int(max_tokens or (GPT4ALL_TOPIC_MAX_TOKENS if include_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS))
 
     try:
         with model.chat_session():
-            answer = model.generate(prompt, max_tokens=300, temp=0.1)
+            answer = model.generate(prompt, max_tokens=token_limit, temp=0.1)
     except Exception as e:
         print(f"[WARN] GPT4All topic window failed: {e}")
         return []
@@ -785,7 +1152,9 @@ def split_long_topic_by_internal_llm(
     topic: Dict,
     segments_by_id: Dict[int, Dict],
     max_segments_per_window: int = 8,
-    min_topic_duration_sec: float = 8.0
+    min_topic_duration_sec: float = 8.0,
+    include_metadata: bool = True,
+    max_tokens: Optional[int] = None
 ) -> List[Dict]:
     """
     Если LLM всё-таки вернула слишком длинную тему, пробуем повторно попросить
@@ -807,7 +1176,12 @@ def split_long_topic_by_internal_llm(
     candidates = []
 
     for window in windows:
-        raw_topics = ask_gpt4all_for_topics_in_window(model, window)
+        raw_topics = ask_gpt4all_for_topics_in_window(
+            model,
+            window,
+            include_metadata=include_metadata,
+            max_tokens=max_tokens
+        )
 
         for raw in raw_topics:
             subtopic = build_topic_from_segment_ids(
@@ -897,10 +1271,13 @@ def score_topic_segment_v2(seg: Dict) -> float:
 def llm_topic_segmentation(
     whisper_segments: List[Dict],
     model=None,
-    max_segments_per_window: int = 8,
-    overlap_segments: int = 2,
+    max_segments_per_window: int = TOPIC_MAX_SEGMENTS_PER_WINDOW,
+    overlap_segments: int = TOPIC_OVERLAP_SEGMENTS,
     min_topic_duration_sec: float = 8.0,
     max_topic_duration_sec: float = 240.0,
+    fast_mode: bool = False,
+    generate_metadata: bool = True,
+    topic_max_tokens: Optional[int] = None,
     progress_callback=None
 ) -> List[Dict]:
     """
@@ -933,6 +1310,10 @@ def llm_topic_segmentation(
     )
 
     candidates = []
+    include_metadata = bool(generate_metadata)
+    effective_max_tokens = int(
+        topic_max_tokens or (GPT4ALL_TOPIC_MAX_TOKENS if include_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS)
+    )
 
     for window_index, window in enumerate(windows, start=1):
         if progress_callback:
@@ -942,7 +1323,12 @@ def llm_topic_segmentation(
                 f"ИИ выделяет подтемы: окно {window_index} из {len(windows)}"
             )
 
-        raw_topics = ask_gpt4all_for_topics_in_window(model, window)
+        raw_topics = ask_gpt4all_for_topics_in_window(
+            model,
+            window,
+            include_metadata=include_metadata,
+            max_tokens=effective_max_tokens
+        )
 
         for raw in raw_topics:
             topic = build_topic_from_segment_ids(
@@ -968,6 +1354,7 @@ def llm_topic_segmentation(
     )
 
     print(f"[DEBUG] LLM windows: {len(windows)}")
+    print(f"[DEBUG] LLM fast_mode: {fast_mode}, generate_metadata={include_metadata}, max_tokens={effective_max_tokens}")
     print(f"[DEBUG] Raw topic candidates: {len(candidates)}")
     print(f"[DEBUG] Topics after deduplication: {len(topics)}")
 
@@ -986,7 +1373,9 @@ def llm_topic_segmentation(
                     topic=topic,
                     segments_by_id=segments_by_id,
                     max_segments_per_window=max_segments_per_window,
-                    min_topic_duration_sec=min_topic_duration_sec
+                    min_topic_duration_sec=min_topic_duration_sec,
+                    include_metadata=include_metadata,
+                    max_tokens=effective_max_tokens
                 )
             )
         else:
@@ -1056,12 +1445,38 @@ def build_srt_for_clip(
     srt_path.write_text("\n".join(srt_blocks), encoding="utf-8")
 
 
+def build_subtitle_filter(srt_path: Path, position: str = "bottom", font_size: int = 28) -> str:
+    srt_filter_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
+
+    if position == "center":
+        alignment = 5
+        margin_v = 0
+    elif position == "upper_bottom":
+        alignment = 2
+        margin_v = 260
+    else:
+        alignment = 2
+        margin_v = 80
+
+    font_size = max(12, min(int(font_size), 72))
+    force_style = (
+        f"FontName=Arial,FontSize={font_size},"
+        f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        f"Outline=2,Shadow=1,Alignment={alignment},MarginV={margin_v}"
+    )
+
+    return f"subtitles='{srt_filter_path}':force_style='{force_style}'"
+
+
 def export_clip_with_optional_srt(
     video_path: Path,
     seg: Dict,
     out_dir: Path,
     srt_path: Optional[Path] = None,
-    burn_subtitles: bool = False
+    burn_subtitles: bool = False,
+    aspect_mode: str = "original",
+    subtitle_position: str = "bottom",
+    subtitle_font_size: int = 28
 ) -> Path:
     """
     Экспортирует выбранный клип.
@@ -1079,15 +1494,37 @@ def export_clip_with_optional_srt(
     if duration <= 0:
         raise RuntimeError("Некорректная длительность клипа.")
 
-    clip_path = out_dir / f"clip_{clip_id:03d}_{title}_{start:.2f}_{end:.2f}.mp4"
+    variant_parts = []
+    aspect_mode = (aspect_mode or "original").strip().lower()
 
-    vf_args = []
+    filters = []
+
+    if aspect_mode == "vertical_9_16":
+        variant_parts.append("9x16")
+        filters.append("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920")
+
     if burn_subtitles and srt_path is not None and srt_path.exists():
-        # Windows-friendly path for ffmpeg subtitles filter
-        srt_filter_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
-        vf_args = ["-vf", f"subtitles='{srt_filter_path}'"]
+        variant_parts.append("subs")
+        filters.append(build_subtitle_filter(srt_path, position=subtitle_position, font_size=subtitle_font_size))
+
+    variant_suffix = f"_{'_'.join(variant_parts)}" if variant_parts else ""
+    clip_path = out_dir / f"clip_{clip_id:03d}_{title}_{start:.2f}_{end:.2f}{variant_suffix}.mp4"
+
+    vf_args = ["-vf", ",".join(filters)] if filters else []
 
     def cmd_with_encoder(encoder: str) -> List[str]:
+        if encoder == "copy":
+            return [
+                FFMPEG_BIN,
+                "-y",
+                "-ss", str(start),
+                "-i", str(video_path),
+                "-t", str(duration),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(clip_path)
+            ]
+
         if encoder == "h264_nvenc":
             return [
                 FFMPEG_BIN,
@@ -1121,7 +1558,14 @@ def export_clip_with_optional_srt(
 
     errors = []
 
-    encoders = ["h264_nvenc", "libx264"] if USE_NVENC_FOR_EXPORT else ["libx264"]
+    encoders = []
+    if EXPORT_MODE == "copy" and not vf_args and not burn_subtitles:
+        encoders.append("copy")
+
+    if USE_NVENC_FOR_EXPORT:
+        encoders.append("h264_nvenc")
+
+    encoders.append("libx264")
 
     for encoder in encoders:
         cmd = cmd_with_encoder(encoder)
@@ -1145,7 +1589,10 @@ def export_clip_with_optional_srt(
                     "score": seg.get("score"),
                     "encoder": encoder,
                     "srt_path": str(srt_path) if srt_path else None,
-                    "burn_subtitles": burn_subtitles
+                    "burn_subtitles": burn_subtitles,
+                    "aspect_mode": aspect_mode,
+                    "subtitle_position": subtitle_position,
+                    "subtitle_font_size": subtitle_font_size,
                 }
             )
 
@@ -1187,8 +1634,8 @@ def main():
     topics = llm_topic_segmentation(
         whisper_segments=fw_segments,
         model=model,
-        max_segments_per_window=8,
-        overlap_segments=2,
+        max_segments_per_window=TOPIC_MAX_SEGMENTS_PER_WINDOW,
+        overlap_segments=TOPIC_OVERLAP_SEGMENTS,
         min_topic_duration_sec=8.0,
         max_topic_duration_sec=240.0
     )
