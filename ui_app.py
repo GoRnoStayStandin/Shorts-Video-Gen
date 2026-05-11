@@ -12,9 +12,16 @@ from benchmark_tools import (
     GPT4ALL_MODEL_PATH,
     GPT4All,
     MODELS_DIR,
+    ASR_ALLOW_MODEL_DOWNGRADE,
+    ASR_AUTO_TUNE,
     ASR_DEVICE,
     FASTER_WHISPER_MODEL,
     FW_GPU_BATCH_SIZE,
+    CHAPTER_BLOCK_MAX_CHARS,
+    CHAPTER_BLOCK_TARGET_SEC,
+    CHAPTER_MAX_BLOCKS_PER_WINDOW,
+    CHAPTER_MAX_TOKENS,
+    CHAPTER_OVERLAP_BLOCKS,
     GPT4ALL_DEVICE,
     GPT4ALL_FAST_TOPIC_MAX_TOKENS,
     GPT4ALL_TOPIC_MAX_TOKENS,
@@ -24,6 +31,7 @@ from benchmark_tools import (
     TOPIC_OVERLAP_SEGMENTS,
     USE_NVENC_FOR_EXPORT,
     analyze_topic_with_gpt4all_model,
+    build_asr_profile_ladder,
     build_srt_for_clip,
     clean_text_for_topic_analysis,
     download_video_from_url,
@@ -31,6 +39,7 @@ from benchmark_tools import (
     format_timestamp,
     get_video_duration_sec,
     is_supported_video_url,
+    llm_chapter_segmentation,
     llm_topic_segmentation,
     load_gpt4all_model,
     make_topic_label,
@@ -107,6 +116,11 @@ def format_model_option(model_path: str) -> str:
         return str(path.resolve().relative_to(models_dir))
     except ValueError:
         return path.name
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_asr_profile_preview():
+    return build_asr_profile_ladder()
 
 
 # Локальная страховка: чтобы ui_app.py не падал, даже если safe_filename не импортировался из benchmark_tools.
@@ -281,7 +295,7 @@ def download_video_from_link(video_url: str):
 # TIMELINE
 # =========================
 
-def build_timeline_html(segments, duration, selected_clip_id=None):
+def build_timeline_html(segments, duration, selected_clip_id=None, timeline_title="Таймлайн найденных смысловых фрагментов"):
     if not duration or duration <= 0:
         return "<p>Нет данных для таймлайна</p>"
 
@@ -303,7 +317,7 @@ def build_timeline_html(segments, duration, selected_clip_id=None):
         height = "34px" if is_selected else "26px"
         top = "13px" if is_selected else "17px"
 
-        title = html.escape(seg.get("title") or f"Клип {index + 1}")
+        title = html.escape(seg.get("title") or f"Фрагмент {index + 1}")
         tooltip = html.escape(
             f"{title} | {format_timestamp(start)} - {format_timestamp(end)} | score: {score:.2f}"
         )
@@ -386,7 +400,7 @@ def build_timeline_html(segments, duration, selected_clip_id=None):
     </style>
 
     <div class="timeline-box">
-        <div class="timeline-title">Таймлайн найденных смысловых фрагментов</div>
+        <div class="timeline-title">{html.escape(timeline_title)}</div>
         <div class="timeline-bar">
             {markers_html}
         </div>
@@ -437,6 +451,10 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
     topic_dir = project_dir / "topic_segmentation"
     topic_dir.mkdir(exist_ok=True, parents=True)
 
+    segmentation_goal = st.session_state.get("segmentation_goal", "chapters")
+    is_chapter_goal = segmentation_goal == "chapters"
+    goal_label = "главы видео" if is_chapter_goal else "подтемы/Shorts"
+
     topic_mode = st.session_state.get("topic_mode", "fast")
     is_fast_topic_mode = topic_mode == "fast"
 
@@ -451,11 +469,15 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
 
     generate_metadata = bool(st.session_state.get("generate_topic_metadata", False))
     metadata_label = "metadata" if generate_metadata else "bounds"
-    topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
+    if is_chapter_goal:
+        topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else CHAPTER_MAX_TOKENS
+    else:
+        topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
+
     selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
     selected_model_name = Path(selected_model_path).stem
     model_cache_key = ui_safe_filename(selected_model_name, max_len=70)
-    topic_cache_path = topic_dir / f"topic_segments_{topic_mode}_{metadata_label}_{model_cache_key}.json"
+    topic_cache_path = topic_dir / f"topic_segments_{segmentation_goal}_{topic_mode}_{metadata_label}_{model_cache_key}.json"
 
     cached_topics = read_json_if_exists(str(topic_cache_path))
 
@@ -464,15 +486,15 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         st.session_state.topic_segments = cached_topics
         st.session_state.selected_position = 0
         progress_bar.progress(1.0)
-        status_box.success(f"Использую кэш ИИ-сегментации ({topic_mode_label} режим, {selected_model_name}).")
+        status_box.success(f"Использую кэш ИИ-сегментации ({goal_label}, {topic_mode_label} режим, {selected_model_name}).")
         return
 
-    status_box.info(f"Выделяю смысловые подтемы через GPT4All ({topic_mode_label} режим, {metadata_label}, {selected_model_name})...")
+    status_box.info(f"Выделяю {goal_label} через GPT4All ({topic_mode_label} режим, {metadata_label}, {selected_model_name})...")
     progress_bar.progress(0.68)
 
     if GPT4All is None:
         st.session_state.topic_segments = []
-        status_box.error("gpt4all не установлен. Невозможно выполнить ИИ-сегментацию подтем.")
+        status_box.error(f"gpt4all не установлен. Невозможно выполнить ИИ-сегментацию: {goal_label}.")
         progress_bar.progress(1.0)
         return
 
@@ -496,29 +518,43 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         status_box.info(message)
 
     try:
-        enriched = llm_topic_segmentation(
-            whisper_segments=fw_segments,
-            model=model,
-            max_segments_per_window=topic_max_segments,
-            overlap_segments=topic_overlap,
-            min_topic_duration_sec=8.0,
-            max_topic_duration_sec=240.0,
-            fast_mode=is_fast_topic_mode,
-            generate_metadata=generate_metadata,
-            topic_max_tokens=topic_max_tokens,
-            progress_callback=topic_progress
-        )
+        if is_chapter_goal:
+            enriched = llm_chapter_segmentation(
+                whisper_segments=fw_segments,
+                model=model,
+                target_block_duration_sec=CHAPTER_BLOCK_TARGET_SEC,
+                max_block_text_chars=CHAPTER_BLOCK_MAX_CHARS,
+                max_blocks_per_window=CHAPTER_MAX_BLOCKS_PER_WINDOW,
+                overlap_blocks=CHAPTER_OVERLAP_BLOCKS,
+                min_chapter_duration_sec=20.0,
+                generate_metadata=generate_metadata,
+                max_tokens=topic_max_tokens,
+                progress_callback=topic_progress
+            )
+        else:
+            enriched = llm_topic_segmentation(
+                whisper_segments=fw_segments,
+                model=model,
+                max_segments_per_window=topic_max_segments,
+                overlap_segments=topic_overlap,
+                min_topic_duration_sec=8.0,
+                max_topic_duration_sec=240.0,
+                fast_mode=is_fast_topic_mode,
+                generate_metadata=generate_metadata,
+                topic_max_tokens=topic_max_tokens,
+                progress_callback=topic_progress
+            )
 
     except Exception as e:
         st.session_state.topic_segments = []
-        status_box.error(f"Ошибка ИИ-сегментации подтем: {e}")
+        status_box.error(f"Ошибка ИИ-сегментации ({goal_label}): {e}")
         progress_bar.progress(1.0)
         return
 
     if not enriched:
         st.session_state.topic_segments = []
         status_box.warning(
-            "ИИ не нашёл подходящие смысловые подтемы. "
+            f"ИИ не нашёл подходящие {goal_label}. "
             "Обычно это значит, что GPT4All не смог корректно вернуть JSON или контекст модели всё ещё маловат."
         )
         progress_bar.progress(1.0)
@@ -529,10 +565,16 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
     save_json(
         topic_dir / "topic_segmentation_settings.json",
         {
+            "segmentation_goal": segmentation_goal,
+            "goal_label": goal_label,
             "mode": topic_mode,
             "mode_label": topic_mode_label,
             "max_segments_per_window": topic_max_segments,
             "overlap_segments": topic_overlap,
+            "chapter_block_target_sec": CHAPTER_BLOCK_TARGET_SEC if is_chapter_goal else None,
+            "chapter_block_max_chars": CHAPTER_BLOCK_MAX_CHARS if is_chapter_goal else None,
+            "chapter_max_blocks_per_window": CHAPTER_MAX_BLOCKS_PER_WINDOW if is_chapter_goal else None,
+            "chapter_overlap_blocks": CHAPTER_OVERLAP_BLOCKS if is_chapter_goal else None,
             "max_tokens": topic_max_tokens,
             "fast_mode": is_fast_topic_mode,
             "generate_metadata": generate_metadata,
@@ -732,12 +774,16 @@ def render_workspace():
     segments = st.session_state.get("topic_segments", [])
     fw_segments = st.session_state.get("fw_segments", [])
     media_duration = st.session_state.get("media_duration", 0)
+    is_chapter_goal = st.session_state.get("segmentation_goal", "chapters") == "chapters"
+    segment_plural = "главы" if is_chapter_goal else "фрагменты"
+    segment_single = "главе" if is_chapter_goal else "фрагменте"
+    clip_word = "главы" if is_chapter_goal else "клипа"
     st.session_state.setdefault("generated_srt_by_clip", {})
     st.session_state.setdefault("exported_clip_by_clip", {})
     st.session_state.setdefault("preview_clip_by_clip", {})
 
     if not segments:
-        st.warning("Пока нет найденных клипов. Сначала запусти обработку видео.")
+        st.warning(f"Пока нет найденных {segment_plural}. Сначала запусти обработку видео.")
         return
 
     st.divider()
@@ -745,22 +791,25 @@ def render_workspace():
     left_col, right_col = st.columns([0.32, 0.68], gap="large")
 
     with left_col:
-        st.subheader("Найденные фрагменты")
+        st.subheader(f"Найденные {segment_plural}")
 
         def format_clip_label(i):
             seg = segments[i]
             score = float(seg.get("score", 0) or 0)
-            title = seg.get("title") or f"Клип {seg.get('id', i + 1)}"
+            title = seg.get("title") or (f"Глава {seg.get('id', i + 1)}" if is_chapter_goal else f"Клип {seg.get('id', i + 1)}")
             start = format_timestamp(seg.get("start", 0))
             end = format_timestamp(seg.get("end", 0))
 
             if len(title) > 42:
                 title = title[:42] + "..."
 
+            if is_chapter_goal:
+                return f"{i + 1}. {start}-{end} · {title}"
+
             return f"{i + 1}. score {score:.2f} · {start}-{end} · {title}"
 
         selected_position = st.radio(
-            label="Кандидаты отсортированы по убыванию score",
+            label="Главы отсортированы по времени" if is_chapter_goal else "Кандидаты отсортированы по убыванию score",
             options=list(range(len(segments))),
             index=min(st.session_state.get("selected_position", 0), len(segments) - 1),
             format_func=format_clip_label,
@@ -769,11 +818,16 @@ def render_workspace():
 
         st.session_state.selected_position = selected_position
 
-        if st.button("Пересортировать по score", use_container_width=True):
-            st.session_state.topic_segments.sort(
-                key=lambda x: float(x.get("score", 0) or 0),
-                reverse=True
-            )
+        sort_label = "Отсортировать по времени" if is_chapter_goal else "Пересортировать по score"
+
+        if st.button(sort_label, use_container_width=True):
+            if is_chapter_goal:
+                st.session_state.topic_segments.sort(key=lambda x: float(x.get("start", 0) or 0))
+            else:
+                st.session_state.topic_segments.sort(
+                    key=lambda x: float(x.get("score", 0) or 0),
+                    reverse=True
+                )
             st.rerun()
 
     selected_seg = segments[selected_position]
@@ -784,14 +838,15 @@ def render_workspace():
             build_timeline_html(
                 segments=segments,
                 duration=media_duration,
-                selected_clip_id=selected_clip_id
+                selected_clip_id=selected_clip_id,
+                timeline_title="Таймлайн найденных глав" if is_chapter_goal else "Таймлайн найденных смысловых фрагментов"
             ),
             height=150
         )
 
         title_key, summary_key, text_key, start_key, end_key, range_key = ensure_clip_widget_defaults(selected_seg)
 
-        st.subheader("Подробная информация о фрагменте")
+        st.subheader(f"Подробная информация о {segment_single}")
 
         m1, m2, m3, m4 = st.columns(4)
 
@@ -816,7 +871,7 @@ def render_workspace():
                 f"end_id: `{selected_seg.get('end_id')}`"
             )
 
-        with st.expander("Редактирование границ клипа", expanded=True):
+        with st.expander(f"Редактирование границ {clip_word}", expanded=True):
             max_slider_value = max(float(media_duration or 0), float(selected_seg.get("end", 0) or 0), 1.0)
             current_start = max(0.0, min(float(selected_seg.get("start", 0) or 0), max_slider_value))
             current_end = max(current_start + 0.1, min(float(selected_seg.get("end", current_start + 1) or current_start + 1), max_slider_value))
@@ -827,7 +882,7 @@ def render_workspace():
             st.session_state[range_key] = (range_start, range_end)
 
             st.slider(
-                "Границы клипа, сек.",
+                f"Границы {clip_word}, сек.",
                 min_value=0.0,
                 max_value=float(max_slider_value),
                 value=st.session_state[range_key],
@@ -903,18 +958,18 @@ def render_workspace():
                 st.rerun()
 
         st.text_input(
-            "Название клипа",
+            "Название главы" if is_chapter_goal else "Название клипа",
             key=title_key
         )
 
         st.text_area(
-            "Summary клипа",
+            "Summary главы" if is_chapter_goal else "Summary клипа",
             key=summary_key,
             height=100
         )
 
         st.text_area(
-            "Текст клипа / что говорится во фрагменте",
+            "Текст главы / что говорится в этом разделе" if is_chapter_goal else "Текст клипа / что говорится во фрагменте",
             key=text_key,
             height=220
         )
@@ -1108,6 +1163,7 @@ def decode_uploaded_text(uploaded_file) -> str:
 
 def model_segments_as_intervals():
     intervals = []
+    is_chapter_goal = st.session_state.get("segmentation_goal", "chapters") == "chapters"
 
     for seg in st.session_state.get("topic_segments", []) or []:
         start = float(seg.get("start", 0) or 0)
@@ -1119,7 +1175,7 @@ def model_segments_as_intervals():
         intervals.append({
             "start": start,
             "end": end,
-            "label": seg.get("title") or f"Клип {seg.get('id', len(intervals) + 1)}",
+            "label": seg.get("title") or (f"Глава {seg.get('id', len(intervals) + 1)}" if is_chapter_goal else f"Клип {seg.get('id', len(intervals) + 1)}"),
             "source": "model",
         })
 
@@ -1139,9 +1195,15 @@ def format_interval_for_option(index: int, intervals: list, source_label: str) -
 
 
 def render_timestamp_evaluation():
-    with st.expander("Оценка таймингов / F1-score", expanded=False):
+    is_chapter_goal = st.session_state.get("segmentation_goal", "chapters") == "chapters"
+    eval_title = "Оценка глав / F1-score" if is_chapter_goal else "Оценка таймингов / F1-score"
+
+    with st.expander(eval_title, expanded=False):
         st.caption(
+            "Загрузите или вставьте тайминги глав, выберите эталон и сравниваемый блок. " if is_chapter_goal else
             "Загрузите или вставьте тайминги, выберите эталон и сравниваемый блок. "
+        )
+        st.caption(
             "Сегмент считается найденным, если IoU по времени выше заданного порога."
         )
 
@@ -1205,8 +1267,9 @@ def render_timestamp_evaluation():
             })
 
         if model_intervals:
+            model_source_label = "Текущие главы модели" if is_chapter_goal else "Текущие сегменты модели"
             sources.append({
-                "label": format_interval_for_option(len(sources), model_intervals, "Текущие сегменты модели"),
+                "label": format_interval_for_option(len(sources), model_intervals, model_source_label),
                 "intervals": model_intervals,
                 "kind": "model",
                 "index": None,
@@ -1297,15 +1360,36 @@ def render_timestamp_evaluation():
 st.title("AI-инструмент для создания коротких клипов из видео")
 
 st.caption(
-    "Загрузка видео → распознавание речи → ИИ-сегментация подтем → оценка пригодности → "
+    "Загрузка видео → распознавание речи → ИИ-сегментация глав или подтем → оценка пригодности → "
     "редактирование карточки → генерация субтитров → экспорт выбранного клипа."
 )
 
 with st.expander("Настройки ускорения", expanded=False):
+    asr_hardware, asr_profiles = get_asr_profile_preview()
+    first_asr_profile = asr_profiles[0] if asr_profiles else {}
+
     st.write(
-        f"**ASR:** faster-whisper `{FASTER_WHISPER_MODEL}`, устройство `{ASR_DEVICE}`, "
-        f"GPU batch `{FW_GPU_BATCH_SIZE}`"
+        f"**ASR:** auto-tune `{'on' if ASR_AUTO_TUNE else 'off'}`, "
+        f"запрос устройства `{ASR_DEVICE}`, downgrade модели `{'on' if ASR_ALLOW_MODEL_DOWNGRADE else 'off'}`"
     )
+
+    if first_asr_profile:
+        st.write(
+            "**ASR первый профиль:** "
+            f"`{first_asr_profile.get('model')}` · `{first_asr_profile.get('device')}` · "
+            f"`{first_asr_profile.get('compute_type')}` · batch `{first_asr_profile.get('batch_size')}`"
+        )
+
+    if asr_hardware.get("gpu_available"):
+        st.caption(
+            f"GPU: {asr_hardware.get('gpu_name')} · "
+            f"VRAM free/total: {asr_hardware.get('gpu_memory_free_mb')}/{asr_hardware.get('gpu_memory_total_mb')} MB · "
+            f"RAM available/total: {asr_hardware.get('ram_available_mb')}/{asr_hardware.get('ram_total_mb')} MB"
+        )
+    else:
+        gpu_error = asr_hardware.get("gpu_error") or "NVIDIA GPU не обнаружена"
+        st.caption(f"GPU: {gpu_error}. ASR будет использовать CPU fallback.")
+
     st.write(
         f"**GPT4All:** устройство `{GPT4ALL_DEVICE}` · "
         f"окно сегментации `{TOPIC_MAX_SEGMENTS_PER_WINDOW}` сегм., overlap `{TOPIC_OVERLAP_SEGMENTS}`"
@@ -1313,7 +1397,8 @@ with st.expander("Настройки ускорения", expanded=False):
     st.write(f"**Экспорт:** NVENC {'включён' if USE_NVENC_FOR_EXPORT else 'выключен'} с fallback на libx264")
     st.caption(
         "Эти значения можно менять через переменные окружения без правки кода: "
-        "ASR_DEVICE, FW_GPU_BATCH_SIZE, GPT4ALL_DEVICE, USE_NVENC_FOR_EXPORT."
+        "ASR_DEVICE, ASR_AUTO_TUNE, ASR_ALLOW_MODEL_DOWNGRADE, FASTER_WHISPER_MODEL, "
+        "FW_GPU_BATCH_SIZE, GPT4ALL_DEVICE, USE_NVENC_FOR_EXPORT."
     )
 
 available_model_paths = [str(path) for path in get_available_gpt4all_models()]
@@ -1338,14 +1423,27 @@ else:
 model_changed = previous_model_path and previous_model_path != selected_gpt4all_model_path
 st.session_state.gpt4all_model_path = selected_gpt4all_model_path
 
+previous_segmentation_goal = st.session_state.get("segmentation_goal", "chapters")
+segmentation_goal_label = st.radio(
+    "Что ищем на этом проходе",
+    options=["Главы видео", "Подтемы / Shorts"],
+    index=0 if previous_segmentation_goal == "chapters" else 1,
+    horizontal=True,
+    help=(
+        "Главы видео подходят для сравнения с авторскими или человеческими таймингами. "
+        "Подтемы / Shorts — старый режим поиска коротких смысловых фрагментов."
+    )
+)
+selected_segmentation_goal = "chapters" if segmentation_goal_label == "Главы видео" else "topics"
+
 topic_mode_label = st.radio(
     "Режим ИИ-сегментации",
     options=["Быстрый", "Качественный"],
     index=0,
     horizontal=True,
     help=(
-        "Быстрый режим просит GPT4All только найти границы подтем, без title/summary для каждого окна. "
-        "Качественный режим генерирует title и summary сразу, но работает заметно дольше."
+        "Быстрый режим просит GPT4All только найти границы, без title/summary для каждого окна. "
+        "Качественный режим может генерировать title и summary сразу, но работает заметно дольше."
     )
 )
 
@@ -1353,23 +1451,32 @@ selected_topic_mode = "fast" if topic_mode_label == "Быстрый" else "quali
 generate_topic_metadata = st.checkbox(
     "Генерировать title/summary сразу",
     value=False,
-    help="Если выключено, GPT4All ищет только границы подтем. Название и summary можно сгенерировать позже для выбранного клипа."
+    help="Если выключено, GPT4All ищет только границы. Название и summary можно сгенерировать позже для выбранного фрагмента."
 )
 
+goal_changed = previous_segmentation_goal != selected_segmentation_goal
 mode_changed = st.session_state.get("topic_mode") and st.session_state.topic_mode != selected_topic_mode
 metadata_changed = (
     "generate_topic_metadata" in st.session_state
     and st.session_state.generate_topic_metadata != generate_topic_metadata
 )
 
-if mode_changed or metadata_changed or model_changed:
+if goal_changed or mode_changed or metadata_changed or model_changed:
     for key in ["topic_segments", "selected_position", "generated_srt_by_clip", "exported_clip_by_clip", "preview_clip_by_clip"]:
         st.session_state.pop(key, None)
 
+st.session_state.segmentation_goal = selected_segmentation_goal
 st.session_state.topic_mode = selected_topic_mode
 st.session_state.generate_topic_metadata = generate_topic_metadata
 
-if selected_topic_mode == "fast":
+if selected_segmentation_goal == "chapters":
+    st.caption(
+        f"Главы: ASR сжимается в блоки по `{CHAPTER_BLOCK_TARGET_SEC}` сек., "
+        f"до `{CHAPTER_BLOCK_MAX_CHARS}` символов на блок; окно `{CHAPTER_MAX_BLOCKS_PER_WINDOW}` блоков, "
+        f"overlap `{CHAPTER_OVERLAP_BLOCKS}`, max tokens `{CHAPTER_MAX_TOKENS}`. "
+        "Этот режим используйте для F1 по таймингам глав."
+    )
+elif selected_topic_mode == "fast":
     st.caption(
         f"Быстрый режим: окно `{TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW}` ASR-сегм., "
         f"overlap `{TOPIC_FAST_OVERLAP_SEGMENTS}`, max tokens `{GPT4ALL_FAST_TOPIC_MAX_TOKENS}`. "

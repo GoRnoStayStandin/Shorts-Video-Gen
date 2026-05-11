@@ -1,5 +1,6 @@
 print("RUNNING FILE:", __file__)
 
+import gc
 import json
 import math
 import os
@@ -116,6 +117,10 @@ FW_CPU_BATCH_SIZE = get_env_int("FW_CPU_BATCH_SIZE", 1)
 FW_BEAM_SIZE = get_env_int("FW_BEAM_SIZE", 5)
 FW_VAD_FILTER = get_env_bool("FW_VAD_FILTER", True)
 ENABLE_ASR_CACHE = get_env_bool("ENABLE_ASR_CACHE", True)
+ASR_AUTO_TUNE = get_env_bool("ASR_AUTO_TUNE", True)
+ASR_ALLOW_MODEL_DOWNGRADE = get_env_bool("ASR_ALLOW_MODEL_DOWNGRADE", True)
+ASR_GPU_LOW_VRAM_MB = get_env_int("ASR_GPU_LOW_VRAM_MB", 6144)
+ASR_GPU_MIN_FREE_VRAM_MB = get_env_int("ASR_GPU_MIN_FREE_VRAM_MB", 1024)
 
 # GPT4All на Windows часто стабильнее на CPU. При желании можно поставить cuda/nvidia/kompute.
 GPT4ALL_DEVICE = os.getenv("GPT4ALL_DEVICE", "cpu").strip().lower()
@@ -126,6 +131,11 @@ TOPIC_MAX_SEGMENTS_PER_WINDOW = get_env_int("TOPIC_MAX_SEGMENTS_PER_WINDOW", 12)
 TOPIC_OVERLAP_SEGMENTS = get_env_int("TOPIC_OVERLAP_SEGMENTS", 2)
 TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW = get_env_int("TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW", 24)
 TOPIC_FAST_OVERLAP_SEGMENTS = get_env_int("TOPIC_FAST_OVERLAP_SEGMENTS", 0)
+CHAPTER_BLOCK_TARGET_SEC = get_env_int("CHAPTER_BLOCK_TARGET_SEC", 30)
+CHAPTER_BLOCK_MAX_CHARS = get_env_int("CHAPTER_BLOCK_MAX_CHARS", 90)
+CHAPTER_MAX_BLOCKS_PER_WINDOW = get_env_int("CHAPTER_MAX_BLOCKS_PER_WINDOW", 64)
+CHAPTER_OVERLAP_BLOCKS = get_env_int("CHAPTER_OVERLAP_BLOCKS", 2)
+CHAPTER_MAX_TOKENS = get_env_int("CHAPTER_MAX_TOKENS", 220)
 
 # Экспорт клипов. Если NVENC недоступен, код автоматически откатится на libx264.
 USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
@@ -134,7 +144,7 @@ USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
 # но рез может попасть не точно в кадр, если start не на keyframe.
 EXPORT_MODE = os.getenv("EXPORT_MODE", "reencode").strip().lower()
 
-LAST_ASR_RUNTIME: Dict[str, str] = {}
+LAST_ASR_RUNTIME: Dict = {}
 
 SUPPORTED_VIDEO_HOSTS = {
     "youtube.com",
@@ -448,6 +458,244 @@ def get_nvidia_gpu_snapshot() -> Dict:
 # ASR
 # =========================
 
+KNOWN_WHISPER_MODEL_ORDER = ["large-v3", "large-v2", "large", "medium", "small", "base"]
+
+
+def parse_optional_float(value) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def detect_hardware_profile() -> Dict:
+    """Lightweight hardware snapshot for ASR auto-tuning."""
+    profile: Dict = {
+        "asr_device_request": ASR_DEVICE,
+        "asr_auto_tune": ASR_AUTO_TUNE,
+        "ram_total_mb": None,
+        "ram_available_mb": None,
+        "gpu_available": False,
+        "gpu_name": None,
+        "gpu_memory_total_mb": None,
+        "gpu_memory_free_mb": None,
+        "gpu_compute_capability": None,
+        "gpu_error": None,
+    }
+
+    if psutil is not None:
+        try:
+            vm = psutil.virtual_memory()
+            profile["ram_total_mb"] = round(vm.total / (1024 * 1024), 1)
+            profile["ram_available_mb"] = round(vm.available / (1024 * 1024), 1)
+        except Exception as e:
+            profile["ram_error"] = str(e)
+
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=name,memory.total,memory.free,compute_cap",
+        "--format=csv,noheader,nounits",
+    ]
+
+    try:
+        code, out, err, _ = run_cmd(cmd)
+        if code != 0:
+            profile["gpu_error"] = err.strip() or "nvidia-smi failed"
+            return profile
+
+        line = out.strip().splitlines()[0]
+        parts = [part.strip() for part in line.split(",")]
+
+        if len(parts) < 3:
+            profile["gpu_error"] = f"unexpected nvidia-smi output: {line}"
+            return profile
+
+        profile.update({
+            "gpu_available": True,
+            "gpu_name": parts[0],
+            "gpu_memory_total_mb": parse_optional_float(parts[1]),
+            "gpu_memory_free_mb": parse_optional_float(parts[2]),
+            "gpu_compute_capability": parts[3] if len(parts) >= 4 else None,
+        })
+    except Exception as e:
+        profile["gpu_error"] = str(e)
+
+    return profile
+
+
+def build_whisper_model_ladder(selected_model: str, allow_downgrade: bool = ASR_ALLOW_MODEL_DOWNGRADE) -> List[str]:
+    selected_model = str(selected_model or "medium").strip() or "medium"
+
+    if not allow_downgrade:
+        return [selected_model]
+
+    selected_key = selected_model.lower()
+    lower_order = [name.lower() for name in KNOWN_WHISPER_MODEL_ORDER]
+
+    if selected_key in lower_order:
+        start_index = lower_order.index(selected_key)
+        return KNOWN_WHISPER_MODEL_ORDER[start_index:]
+
+    # Custom/HF model IDs are tried first, then safe built-in fallbacks.
+    ladder = [selected_model]
+    for fallback in ("small", "base"):
+        if fallback.lower() != selected_key:
+            ladder.append(fallback)
+    return ladder
+
+
+def add_asr_profile_once(profiles: List[Dict], profile: Dict):
+    key = (
+        profile.get("model"),
+        profile.get("device"),
+        profile.get("compute_type"),
+        int(profile.get("batch_size", 1)),
+        int(profile.get("beam_size", FW_BEAM_SIZE)),
+    )
+
+    for existing in profiles:
+        existing_key = (
+            existing.get("model"),
+            existing.get("device"),
+            existing.get("compute_type"),
+            int(existing.get("batch_size", 1)),
+            int(existing.get("beam_size", FW_BEAM_SIZE)),
+        )
+        if existing_key == key:
+            return
+
+    profile["index"] = len(profiles) + 1
+    profiles.append(profile)
+
+
+def choose_gpu_batch_size(hardware: Dict) -> int:
+    if "FW_GPU_BATCH_SIZE" in os.environ:
+        return max(1, FW_GPU_BATCH_SIZE)
+
+    total_vram = float(hardware.get("gpu_memory_total_mb") or 0)
+    free_vram = float(hardware.get("gpu_memory_free_mb") or 0)
+    usable_vram = free_vram if free_vram > 0 else total_vram
+
+    if total_vram >= 20000 and usable_vram >= 12000:
+        return 8
+    if total_vram >= 12000 and usable_vram >= 7000:
+        return 4
+    if total_vram >= 8000 and usable_vram >= 4500:
+        return 2
+    return 1
+
+
+def choose_gpu_compute_types(hardware: Dict) -> List[str]:
+    if "FW_CUDA_COMPUTE_TYPE" in os.environ:
+        preferred = FW_CUDA_COMPUTE_TYPE
+        compute_types = [preferred, "int8_float16", "int8", "float16"]
+    else:
+        total_vram = float(hardware.get("gpu_memory_total_mb") or 0)
+        free_vram = float(hardware.get("gpu_memory_free_mb") or 0)
+
+        if total_vram >= 12000 and free_vram >= 7000:
+            preferred = "float16"
+            compute_types = [preferred, "int8_float16", "int8"]
+        else:
+            preferred = "int8_float16"
+            compute_types = [preferred, "int8"]
+
+    result = []
+
+    for compute_type in compute_types:
+        if compute_type and compute_type not in result:
+            result.append(compute_type)
+
+    return result
+
+
+def choose_asr_beam_size(hardware: Dict, device: str) -> int:
+    if "FW_BEAM_SIZE" in os.environ:
+        return max(1, FW_BEAM_SIZE)
+
+    if device == "cuda":
+        total_vram = float(hardware.get("gpu_memory_total_mb") or 0)
+        if total_vram and total_vram < ASR_GPU_LOW_VRAM_MB:
+            return 1
+        if total_vram and total_vram < 12000:
+            return 3
+
+    return FW_BEAM_SIZE
+
+
+def build_asr_profile_ladder() -> Tuple[Dict, List[Dict]]:
+    hardware = detect_hardware_profile()
+    requested_device = (ASR_DEVICE or "auto").strip().lower()
+    selected_model = str(FASTER_WHISPER_MODEL or "medium").strip() or "medium"
+    model_ladder = build_whisper_model_ladder(selected_model)
+    profiles: List[Dict] = []
+
+    if requested_device == "cpu":
+        cpu_beam_size = choose_asr_beam_size(hardware, "cpu")
+        for model_name in model_ladder:
+            add_asr_profile_once(profiles, {
+                "model": model_name,
+                "device": "cpu",
+                "compute_type": FW_CPU_COMPUTE_TYPE,
+                "batch_size": max(1, FW_CPU_BATCH_SIZE),
+                "beam_size": cpu_beam_size,
+                "reason": "ASR_DEVICE=cpu",
+            })
+        return hardware, profiles
+
+    can_try_gpu = requested_device in {"auto", "cuda"} and bool(hardware.get("gpu_available"))
+
+    if can_try_gpu and ASR_AUTO_TUNE:
+        gpu_batch_size = choose_gpu_batch_size(hardware)
+        gpu_beam_size = choose_asr_beam_size(hardware, "cuda")
+        compute_types = choose_gpu_compute_types(hardware)
+        total_vram = float(hardware.get("gpu_memory_total_mb") or 0)
+        free_vram = float(hardware.get("gpu_memory_free_mb") or 0)
+        reason = "auto_gpu"
+
+        if total_vram and total_vram < ASR_GPU_LOW_VRAM_MB:
+            reason = "auto_gpu_low_vram"
+        elif free_vram and free_vram < ASR_GPU_MIN_FREE_VRAM_MB:
+            reason = "auto_gpu_low_free_vram"
+
+        # Try the requested model first, then lower models, keeping batch=1 fallbacks to stay on GPU.
+        for model_index, model_name in enumerate(model_ladder):
+            for compute_type in compute_types:
+                batch_size = gpu_batch_size if model_index == 0 and compute_type == compute_types[0] else 1
+                add_asr_profile_once(profiles, {
+                    "model": model_name,
+                    "device": "cuda",
+                    "compute_type": compute_type,
+                    "batch_size": batch_size,
+                    "beam_size": gpu_beam_size,
+                    "reason": reason if model_index == 0 else "auto_gpu_model_downgrade",
+                })
+    elif can_try_gpu:
+        add_asr_profile_once(profiles, {
+            "model": selected_model,
+            "device": "cuda",
+            "compute_type": FW_CUDA_COMPUTE_TYPE,
+            "batch_size": max(1, FW_GPU_BATCH_SIZE),
+            "beam_size": choose_asr_beam_size(hardware, "cuda"),
+            "reason": "manual_gpu_profile",
+        })
+
+    cpu_beam_size = choose_asr_beam_size(hardware, "cpu")
+    for model_name in model_ladder:
+        add_asr_profile_once(profiles, {
+            "model": model_name,
+            "device": "cpu",
+            "compute_type": FW_CPU_COMPUTE_TYPE,
+            "batch_size": max(1, FW_CPU_BATCH_SIZE),
+            "beam_size": cpu_beam_size,
+            "reason": "cpu_fallback",
+        })
+
+    return hardware, profiles
+
+
 def has_nvidia_gpu() -> bool:
     """Быстрая проверка: видит ли система NVIDIA GPU через nvidia-smi."""
     try:
@@ -471,7 +719,7 @@ def resolve_asr_device() -> str:
     return "cpu"
 
 
-def load_faster_whisper_model(preferred_device: Optional[str] = None):
+def load_faster_whisper_model(preferred_device: Optional[str] = None, profile: Optional[Dict] = None):
     """
     Загружает faster-whisper с автоматическим выбором CUDA/CPU.
 
@@ -482,43 +730,46 @@ def load_faster_whisper_model(preferred_device: Optional[str] = None):
     if WhisperModel is None:
         raise RuntimeError("faster-whisper не установлен")
 
-    target_device = (preferred_device or resolve_asr_device()).strip().lower()
+    if profile is None:
+        target_device = (preferred_device or resolve_asr_device()).strip().lower()
+        profile = {
+            "model": FASTER_WHISPER_MODEL,
+            "device": target_device,
+            "compute_type": FW_CUDA_COMPUTE_TYPE if target_device == "cuda" else FW_CPU_COMPUTE_TYPE,
+            "batch_size": FW_GPU_BATCH_SIZE if target_device == "cuda" else FW_CPU_BATCH_SIZE,
+            "beam_size": FW_BEAM_SIZE,
+            "reason": "direct_load",
+            "index": 1,
+        }
 
-    candidates = []
-    if target_device == "cuda":
-        candidates.append(("cuda", FW_CUDA_COMPUTE_TYPE))
+    model_name = str(profile.get("model") or FASTER_WHISPER_MODEL)
+    device = str(profile.get("device") or "cpu")
+    compute_type = str(profile.get("compute_type") or (FW_CUDA_COMPUTE_TYPE if device == "cuda" else FW_CPU_COMPUTE_TYPE))
 
-    # CPU fallback всегда оставляем последним вариантом.
-    candidates.append(("cpu", FW_CPU_COMPUTE_TYPE))
-
-    last_error = None
-
-    for device, compute_type in candidates:
-        try:
-            print(
-                f"[INFO] Loading faster-whisper model={FASTER_WHISPER_MODEL} "
-                f"device={device} compute_type={compute_type}"
-            )
-            model = WhisperModel(
-                FASTER_WHISPER_MODEL,
-                device=device,
-                compute_type=compute_type
-            )
-            LAST_ASR_RUNTIME.clear()
-            LAST_ASR_RUNTIME.update({
-                "device": device,
-                "compute_type": compute_type,
-                "model": FASTER_WHISPER_MODEL,
-            })
-            return model
-        except Exception as e:
-            last_error = e
-            print(f"[WARN] faster-whisper failed on {device}/{compute_type}: {e}")
-
-    raise RuntimeError(f"Не удалось загрузить faster-whisper ни на CUDA, ни на CPU: {last_error}")
+    print(
+        f"[INFO] Loading faster-whisper model={model_name} "
+        f"device={device} compute_type={compute_type} "
+        f"batch={profile.get('batch_size', 1)} reason={profile.get('reason', 'unknown')}"
+    )
+    model = WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type
+    )
+    LAST_ASR_RUNTIME.clear()
+    LAST_ASR_RUNTIME.update({
+        "device": device,
+        "compute_type": compute_type,
+        "model": model_name,
+        "batch_size": int(profile.get("batch_size", 1) or 1),
+        "beam_size": int(profile.get("beam_size", FW_BEAM_SIZE) or FW_BEAM_SIZE),
+        "profile_index": profile.get("index"),
+        "profile_reason": profile.get("reason"),
+    })
+    return model
 
 
-def run_faster_whisper_transcribe(model, wav_path: Path):
+def run_faster_whisper_transcribe(model, wav_path: Path, profile: Optional[Dict] = None):
     """
     Запускает обычную или batched-транскрибацию в зависимости от устройства.
 
@@ -530,12 +781,13 @@ def run_faster_whisper_transcribe(model, wav_path: Path):
     всё равно падает не из-за CUDA, код откатывается на обычный transcribe()
     на том же устройстве, чтобы обработка не прерывалась.
     """
-    device = LAST_ASR_RUNTIME.get("device", "cpu")
-    batch_size = FW_GPU_BATCH_SIZE if device == "cuda" else FW_CPU_BATCH_SIZE
+    device = str((profile or {}).get("device") or LAST_ASR_RUNTIME.get("device", "cpu"))
+    batch_size = int((profile or {}).get("batch_size") or LAST_ASR_RUNTIME.get("batch_size") or (FW_GPU_BATCH_SIZE if device == "cuda" else FW_CPU_BATCH_SIZE))
+    beam_size = int((profile or {}).get("beam_size") or LAST_ASR_RUNTIME.get("beam_size") or FW_BEAM_SIZE)
 
     base_kwargs = {
         "language": LANGUAGE,
-        "beam_size": FW_BEAM_SIZE,
+        "beam_size": beam_size,
         "vad_filter": FW_VAD_FILTER,
     }
 
@@ -600,10 +852,10 @@ def transcribe_with_faster_whisper(
     ]
 
     Важный момент: faster-whisper возвращает ленивый генератор сегментов.
-    Поэтому часть CUDA-ошибок, например отсутствие cublas64_12.dll, возникает
-    не в момент вызова model.transcribe(), а позже — при проходе по segments_iter.
-    Из-за этого весь проход по сегментам специально находится внутри try/except.
-    Если CUDA падает, код повторяет распознавание на CPU int8 вместо падения UI.
+    Поэтому часть CUDA-ошибок, например OOM или отсутствие cublas64_12.dll,
+    возникает не в момент вызова model.transcribe(), а позже — при проходе по
+    segments_iter. Из-за этого весь проход находится внутри try/except, а ASR
+    использует GPU-first лестницу профилей перед CPU fallback.
     """
     out_dir.mkdir(exist_ok=True, parents=True)
 
@@ -628,18 +880,42 @@ def transcribe_with_faster_whisper(
 
     extract_audio_wav(str(video_path), str(wav_path), sr=16000)
 
-    def run_and_collect(preferred_device: Optional[str] = None) -> Tuple[List[str], List[str], List[Dict], List[str]]:
+    hardware_profile, asr_profiles = build_asr_profile_ladder()
+    save_json(
+        out_dir / "asr_auto_profile_ladder.json",
+        {
+            "hardware": hardware_profile,
+            "profiles": asr_profiles,
+        }
+    )
+
+    if not asr_profiles:
+        raise RuntimeError("Не удалось построить ни одного ASR-профиля.")
+
+    def run_and_collect(profile: Dict) -> Tuple[List[str], List[str], List[Dict], List[str]]:
+        profile_index = int(profile.get("index") or 1)
+        profile_count = len(asr_profiles)
+        model_name = str(profile.get("model") or FASTER_WHISPER_MODEL)
+        device_label = str(profile.get("device") or "auto")
+        compute_type = str(profile.get("compute_type") or "default")
+        batch_size = int(profile.get("batch_size") or 1)
+
         if progress_callback:
-            device_label = preferred_device or resolve_asr_device()
-            progress_callback(0.15, f"Загружаю faster-whisper ({device_label})...")
+            progress_callback(
+                0.15,
+                f"Загружаю faster-whisper: профиль {profile_index}/{profile_count} "
+                f"({model_name}, {device_label}, {compute_type}, batch {batch_size})..."
+            )
 
-        model = load_faster_whisper_model(preferred_device=preferred_device)
+        model = load_faster_whisper_model(profile=profile)
 
         if progress_callback:
-            runtime_device = LAST_ASR_RUNTIME.get("device", preferred_device or "auto")
-            progress_callback(0.22, f"Распознаю речь ({runtime_device})...")
+            progress_callback(
+                0.22,
+                f"Распознаю речь ({device_label}, {model_name}, {compute_type}, batch {batch_size})..."
+            )
 
-        segments_iter, _info = run_faster_whisper_transcribe(model, wav_path)
+        segments_iter, _info = run_faster_whisper_transcribe(model, wav_path, profile=profile)
 
         transcript_parts: List[str] = []
         timed_lines: List[str] = []
@@ -677,34 +953,65 @@ def transcribe_with_faster_whisper(
             if progress_callback and media_duration > 0:
                 local = min(seg_end / media_duration, 1.0)
                 runtime_device = LAST_ASR_RUNTIME.get("device", "unknown")
+                runtime_model = LAST_ASR_RUNTIME.get("model", "unknown")
                 progress_callback(
                     0.22 + local * 0.43,
-                    f"Распознаю речь ({runtime_device}): {format_timestamp(seg_end)} / {format_timestamp(media_duration)}"
+                    f"Распознаю речь ({runtime_device}, {runtime_model}): "
+                    f"{format_timestamp(seg_end)} / {format_timestamp(media_duration)}"
                 )
 
         return transcript_parts, timed_lines, segments_json, srt_blocks
 
-    try:
-        transcript_parts, timed_lines, segments_json, srt_blocks = run_and_collect()
-    except Exception as e:
-        if is_cuda_runtime_error(e):
-            print(f"[WARN] faster-whisper CUDA failed during transcription/iteration: {e}")
-            print("[INFO] Retrying faster-whisper on CPU int8...")
+    errors = []
+    transcript_parts: List[str] = []
+    timed_lines: List[str] = []
+    segments_json: List[Dict] = []
+    srt_blocks: List[str] = []
 
+    for profile in asr_profiles:
+        try:
+            transcript_parts, timed_lines, segments_json, srt_blocks = run_and_collect(profile)
+            break
+        except Exception as e:
+            profile_label = (
+                f"{profile.get('model')} / {profile.get('device')} / "
+                f"{profile.get('compute_type')} / batch {profile.get('batch_size')}"
+            )
+            errors.append(f"{profile_label}: {e}")
+            print(f"[WARN] faster-whisper failed on ASR profile {profile_label}: {e}")
+
+            gc.collect()
+
+            is_last_profile = int(profile.get("index") or 0) >= len(asr_profiles)
+            if is_last_profile:
+                raise RuntimeError("Не удалось выполнить ASR ни на одном профиле:\n" + "\n".join(errors)) from e
+
+            next_profile = asr_profiles[int(profile.get("index") or 1)]
             if progress_callback:
                 progress_callback(
                     0.20,
-                    "CUDA-библиотеки не найдены или CUDA упала. Переключаюсь на CPU int8..."
+                    "Текущий ASR-профиль упал. Пробую следующий: "
+                    f"{next_profile.get('model')} / {next_profile.get('device')} / "
+                    f"{next_profile.get('compute_type')} / batch {next_profile.get('batch_size')}..."
                 )
 
-            transcript_parts, timed_lines, segments_json, srt_blocks = run_and_collect(preferred_device="cpu")
-        else:
-            raise
+            continue
+
+    if not segments_json:
+        print("[WARN] ASR completed but returned no speech segments.")
 
     txt_path.write_text(" ".join(transcript_parts).strip(), encoding="utf-8")
     timed_txt_path.write_text("\n".join(timed_lines), encoding="utf-8")
     srt_path.write_text("\n".join(srt_blocks), encoding="utf-8")
     save_json(segments_json_path, segments_json)
+    save_json(
+        out_dir / "asr_runtime_profile.json",
+        {
+            **LAST_ASR_RUNTIME,
+            "hardware": hardware_profile,
+            "profile_count": len(asr_profiles),
+        }
+    )
 
     return segments_json
 
@@ -927,6 +1234,178 @@ def split_segments_for_llm_by_count(
         start = max(end - overlap_segments, start + 1)
 
     return windows
+
+
+def truncate_text_for_llm(text: str, max_chars: int) -> str:
+    text = clean_text_for_topic_analysis(text)
+    max_chars = max(20, int(max_chars))
+
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[:max_chars].rsplit(" ", 1)[0].strip()
+    return truncated or text[:max_chars].strip()
+
+
+def build_chapter_blocks_from_segments(
+    whisper_segments: List[Dict],
+    target_duration_sec: int = CHAPTER_BLOCK_TARGET_SEC,
+    max_text_chars: int = CHAPTER_BLOCK_MAX_CHARS
+) -> List[Dict]:
+    prepared_segments = prepare_whisper_segments_with_ids(whisper_segments)
+
+    if not prepared_segments:
+        return []
+
+    target_duration_sec = max(10, int(target_duration_sec))
+    blocks: List[Dict] = []
+    current: List[Dict] = []
+
+    def flush_current():
+        if not current:
+            return
+
+        text = " ".join(seg.get("text", "").strip() for seg in current).strip()
+        blocks.append({
+            "id": len(blocks),
+            "start_id": int(current[0]["id"]),
+            "end_id": int(current[-1]["id"]),
+            "start": float(current[0]["start"]),
+            "end": float(current[-1]["end"]),
+            "text": truncate_text_for_llm(text, max_text_chars),
+        })
+
+    for seg in prepared_segments:
+        current.append(seg)
+
+        if float(current[-1]["end"]) - float(current[0]["start"]) >= target_duration_sec:
+            flush_current()
+            current = []
+
+    flush_current()
+    return blocks
+
+
+def format_chapter_block_for_llm(block: Dict) -> str:
+    return (
+        f"[{block['id']}] "
+        f"{format_timestamp(float(block['start']))}-{format_timestamp(float(block['end']))}: "
+        f"{block.get('text', '')}"
+    )
+
+
+def ask_gpt4all_for_chapters_in_block_window(
+    model,
+    block_window: List[Dict],
+    include_metadata: bool = False,
+    max_tokens: Optional[int] = None
+) -> List[Dict]:
+    if not block_window:
+        return []
+
+    blocks_text = "\n".join(format_chapter_block_for_llm(block) for block in block_window)
+    first_id = int(block_window[0]["id"])
+    last_id = int(block_window[-1]["id"])
+
+    if include_metadata:
+        prompt = f"""
+Раздели блоки транскрипта на крупные главы видео.
+
+Правила:
+- глава = крупный раздел видео, похожий на авторское оглавление;
+- не ищи Shorts, хайлайты или микро-подтемы;
+- не отделяй отдельный пример или мысль, если они относятся к той же главе;
+- главы должны идти по порядку, не пересекаться и вместе покрывать диапазон блоков;
+- если весь диапазон относится к одной главе, верни один диапазон;
+- start_block_id и end_block_id бери только из списка;
+- end_block_id включается;
+- ответ только JSON.
+
+Формат:
+{{"chapters":[{{"title":"...","summary":"...","start_block_id":{first_id},"end_block_id":{last_id}}}]}}
+
+Блоки:
+{blocks_text}
+""".strip()
+    else:
+        prompt = f"""
+Раздели блоки транскрипта на крупные главы видео.
+
+Правила:
+- глава = крупный раздел видео, похожий на авторское оглавление;
+- не ищи Shorts, хайлайты или микро-подтемы;
+- не отделяй отдельный пример или мысль, если они относятся к той же главе;
+- главы должны идти по порядку, не пересекаться и вместе покрывать диапазон блоков;
+- если весь диапазон относится к одной главе, верни один диапазон;
+- start_block_id и end_block_id бери только из списка;
+- end_block_id включается;
+- не пиши title и summary;
+- ответ только JSON.
+
+Формат:
+{{"chapters":[{{"start_block_id":{first_id},"end_block_id":{last_id}}}]}}
+
+Блоки:
+{blocks_text}
+""".strip()
+
+    token_limit = int(max_tokens or CHAPTER_MAX_TOKENS)
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=token_limit, temp=0.1)
+    except Exception as e:
+        print(f"[WARN] GPT4All chapter window failed: {e}")
+        return []
+
+    if not answer:
+        return []
+
+    if "context window" in answer.lower() or "prompt is" in answer.lower():
+        print(f"[WARN] GPT4All context error: {answer[:300]}")
+        return []
+
+    parsed = extract_json_from_model_answer(answer)
+
+    if not parsed:
+        print("[WARN] Could not parse JSON from GPT4All chapter answer")
+        print(answer[:500])
+        return []
+
+    chapters = parsed.get("chapters") or parsed.get("topics") or []
+
+    if not isinstance(chapters, list):
+        return []
+
+    allowed_ids = {int(block["id"]) for block in block_window}
+    min_id = min(allowed_ids)
+    max_id = max(allowed_ids)
+    valid_chapters = []
+
+    for chapter in chapters:
+        try:
+            start_block_id = int(chapter.get("start_block_id", chapter.get("start_id")))
+            end_block_id = int(chapter.get("end_block_id", chapter.get("end_id")))
+        except Exception:
+            continue
+
+        if end_block_id < start_block_id:
+            start_block_id, end_block_id = end_block_id, start_block_id
+
+        start_block_id = max(min_id, min(start_block_id, max_id))
+        end_block_id = max(min_id, min(end_block_id, max_id))
+
+        if start_block_id not in allowed_ids or end_block_id not in allowed_ids:
+            continue
+
+        valid_chapters.append({
+            "title": str(chapter.get("title", "")).strip(),
+            "summary": str(chapter.get("summary", "")).strip(),
+            "start_block_id": start_block_id,
+            "end_block_id": end_block_id,
+        })
+
+    return valid_chapters
 
 
 def ask_gpt4all_for_topics_in_window(
@@ -1436,6 +1915,119 @@ def llm_topic_segmentation(
     topics.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
 
     return topics
+
+
+def llm_chapter_segmentation(
+    whisper_segments: List[Dict],
+    model=None,
+    target_block_duration_sec: int = CHAPTER_BLOCK_TARGET_SEC,
+    max_block_text_chars: int = CHAPTER_BLOCK_MAX_CHARS,
+    max_blocks_per_window: int = CHAPTER_MAX_BLOCKS_PER_WINDOW,
+    overlap_blocks: int = CHAPTER_OVERLAP_BLOCKS,
+    min_chapter_duration_sec: float = 20.0,
+    generate_metadata: bool = False,
+    max_tokens: Optional[int] = None,
+    progress_callback=None
+) -> List[Dict]:
+    """
+    Делит видео на крупные главы. В отличие от llm_topic_segmentation,
+    сначала сжимает ASR в блоки, чтобы LLM видела структуру всего видео.
+    """
+    prepared_segments = prepare_whisper_segments_with_ids(whisper_segments)
+
+    if not prepared_segments:
+        return []
+
+    if model is None:
+        model = load_gpt4all_model(n_ctx=4096)
+
+    blocks = build_chapter_blocks_from_segments(
+        whisper_segments=whisper_segments,
+        target_duration_sec=target_block_duration_sec,
+        max_text_chars=max_block_text_chars
+    )
+
+    if not blocks:
+        return []
+
+    block_windows = split_segments_for_llm_by_count(
+        blocks,
+        max_segments_per_window=max_blocks_per_window,
+        overlap_segments=overlap_blocks
+    )
+
+    segments_by_id = {int(seg["id"]): seg for seg in prepared_segments}
+    blocks_by_id = {int(block["id"]): block for block in blocks}
+    candidates: List[Dict] = []
+    effective_max_tokens = int(max_tokens or CHAPTER_MAX_TOKENS)
+
+    for window_index, block_window in enumerate(block_windows, start=1):
+        if progress_callback:
+            progress_callback(
+                window_index,
+                len(block_windows),
+                f"ИИ выделяет главы: окно {window_index} из {len(block_windows)}"
+            )
+
+        raw_chapters = ask_gpt4all_for_chapters_in_block_window(
+            model,
+            block_window,
+            include_metadata=generate_metadata,
+            max_tokens=effective_max_tokens
+        )
+
+        for raw in raw_chapters:
+            start_block = blocks_by_id.get(int(raw["start_block_id"]))
+            end_block = blocks_by_id.get(int(raw["end_block_id"]))
+
+            if not start_block or not end_block:
+                continue
+
+            chapter = build_topic_from_segment_ids(
+                segments_by_id=segments_by_id,
+                start_id=int(start_block["start_id"]),
+                end_id=int(end_block["end_id"]),
+                title=raw.get("title", ""),
+                summary=raw.get("summary", "")
+            )
+
+            if not chapter:
+                continue
+
+            if float(chapter["duration"]) < min_chapter_duration_sec:
+                continue
+
+            chapter["segment_kind"] = "chapter"
+            chapter["start_block_id"] = int(raw["start_block_id"])
+            chapter["end_block_id"] = int(raw["end_block_id"])
+            candidates.append(chapter)
+
+    chapters = deduplicate_topic_candidates(
+        candidates=candidates,
+        segments_by_id=segments_by_id,
+        min_topic_duration_sec=min_chapter_duration_sec
+    )
+
+    chapters = sorted(chapters, key=lambda x: float(x["start"]))
+
+    print(f"[DEBUG] Chapter blocks: {len(blocks)}")
+    print(f"[DEBUG] Chapter windows: {len(block_windows)}")
+    print(f"[DEBUG] Raw chapter candidates: {len(candidates)}")
+    print(f"[DEBUG] Chapters after deduplication: {len(chapters)}")
+
+    for i, chapter in enumerate(chapters, start=1):
+        chapter["id"] = i
+        chapter["segment_kind"] = "chapter"
+        chapter["score"] = score_topic_segment_v2(chapter)
+
+        print(
+            f"[DEBUG] Chapter {i}: "
+            f"{format_timestamp(chapter['start'])} - {format_timestamp(chapter['end'])}, "
+            f"duration={chapter['duration']:.1f}s, "
+            f"title={chapter.get('title')}"
+        )
+
+    return chapters
 
 
 # =========================
