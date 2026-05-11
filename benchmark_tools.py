@@ -131,11 +131,22 @@ TOPIC_MAX_SEGMENTS_PER_WINDOW = get_env_int("TOPIC_MAX_SEGMENTS_PER_WINDOW", 12)
 TOPIC_OVERLAP_SEGMENTS = get_env_int("TOPIC_OVERLAP_SEGMENTS", 2)
 TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW = get_env_int("TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW", 24)
 TOPIC_FAST_OVERLAP_SEGMENTS = get_env_int("TOPIC_FAST_OVERLAP_SEGMENTS", 0)
-CHAPTER_BLOCK_TARGET_SEC = get_env_int("CHAPTER_BLOCK_TARGET_SEC", 30)
-CHAPTER_BLOCK_MAX_CHARS = get_env_int("CHAPTER_BLOCK_MAX_CHARS", 90)
-CHAPTER_MAX_BLOCKS_PER_WINDOW = get_env_int("CHAPTER_MAX_BLOCKS_PER_WINDOW", 64)
+CHAPTERING_VERSION = os.getenv("CHAPTERING_VERSION", "v3").strip() or "v3"
+CHAPTER_BLOCK_TARGET_SEC = get_env_int("CHAPTER_BLOCK_TARGET_SEC", 20)
+CHAPTER_BLOCK_MAX_CHARS = get_env_int("CHAPTER_BLOCK_MAX_CHARS", 180)
+CHAPTER_MAX_BLOCKS_PER_WINDOW = get_env_int("CHAPTER_MAX_BLOCKS_PER_WINDOW", 48)
 CHAPTER_OVERLAP_BLOCKS = get_env_int("CHAPTER_OVERLAP_BLOCKS", 2)
-CHAPTER_MAX_TOKENS = get_env_int("CHAPTER_MAX_TOKENS", 220)
+CHAPTER_MAX_TOKENS = get_env_int("CHAPTER_MAX_TOKENS", 420)
+CHAPTER_FULL_TRANSCRIPT_MAX_CHARS = get_env_int("CHAPTER_FULL_TRANSCRIPT_MAX_CHARS", 10000)
+CHAPTER_SUMMARY_WINDOW_BLOCKS = get_env_int("CHAPTER_SUMMARY_WINDOW_BLOCKS", 8)
+CHAPTER_SUMMARY_OVERLAP_BLOCKS = get_env_int("CHAPTER_SUMMARY_OVERLAP_BLOCKS", 1)
+CHAPTER_SUMMARY_MAX_TOKENS = get_env_int("CHAPTER_SUMMARY_MAX_TOKENS", 150)
+CHAPTER_OUTLINE_MAX_TOKENS = get_env_int("CHAPTER_OUTLINE_MAX_TOKENS", 520)
+CHAPTER_REFINE_CONTEXT_BLOCKS = get_env_int("CHAPTER_REFINE_CONTEXT_BLOCKS", 4)
+CHAPTER_BOUNDARY_WINDOW_BLOCKS = get_env_int("CHAPTER_BOUNDARY_WINDOW_BLOCKS", 14)
+CHAPTER_BOUNDARY_OVERLAP_BLOCKS = get_env_int("CHAPTER_BOUNDARY_OVERLAP_BLOCKS", 4)
+CHAPTER_BOUNDARY_MAX_TOKENS = get_env_int("CHAPTER_BOUNDARY_MAX_TOKENS", 320)
+CHAPTER_BOUNDARY_SENSITIVITY = os.getenv("CHAPTER_BOUNDARY_SENSITIVITY", "detailed").strip().lower()
 
 # Экспорт клипов. Если NVENC недоступен, код автоматически откатится на libx264.
 USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
@@ -145,6 +156,7 @@ USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
 EXPORT_MODE = os.getenv("EXPORT_MODE", "reencode").strip().lower()
 
 LAST_ASR_RUNTIME: Dict = {}
+LAST_CHAPTERING_DEBUG: Dict = {}
 
 SUPPORTED_VIDEO_HOSTS = {
     "youtube.com",
@@ -1260,20 +1272,27 @@ def build_chapter_blocks_from_segments(
     target_duration_sec = max(10, int(target_duration_sec))
     blocks: List[Dict] = []
     current: List[Dict] = []
+    previous_block_end: Optional[float] = None
 
     def flush_current():
+        nonlocal previous_block_end
+
         if not current:
             return
 
         text = " ".join(seg.get("text", "").strip() for seg in current).strip()
+        block_start = float(current[0]["start"])
+        block_end = float(current[-1]["end"])
         blocks.append({
             "id": len(blocks),
             "start_id": int(current[0]["id"]),
             "end_id": int(current[-1]["id"]),
-            "start": float(current[0]["start"]),
-            "end": float(current[-1]["end"]),
+            "start": block_start,
+            "end": block_end,
+            "gap_before": None if previous_block_end is None else max(0.0, block_start - previous_block_end),
             "text": truncate_text_for_llm(text, max_text_chars),
         })
+        previous_block_end = block_end
 
     for seg in prepared_segments:
         current.append(seg)
@@ -1309,14 +1328,15 @@ def ask_gpt4all_for_chapters_in_block_window(
 
     if include_metadata:
         prompt = f"""
-Раздели блоки транскрипта на крупные главы видео.
+Раздели блоки транскрипта на главы видео по сменам основной темы.
 
 Правила:
 - глава = крупный раздел видео, похожий на авторское оглавление;
 - не ищи Shorts, хайлайты или микро-подтемы;
 - не отделяй отдельный пример или мысль, если они относятся к той же главе;
-- главы должны идти по порядку, не пересекаться и вместе покрывать диапазон блоков;
-- если весь диапазон относится к одной главе, верни один диапазон;
+- ставь новую главу при явной смене предмета разговора, вопроса или этапа объяснения;
+- главы должны идти по порядку, не пересекаться и покрывать диапазон блоков;
+- не склеивай вступление, основную часть и завершение, если они отличаются по роли;
 - start_block_id и end_block_id бери только из списка;
 - end_block_id включается;
 - ответ только JSON.
@@ -1329,14 +1349,15 @@ def ask_gpt4all_for_chapters_in_block_window(
 """.strip()
     else:
         prompt = f"""
-Раздели блоки транскрипта на крупные главы видео.
+Раздели блоки транскрипта на главы видео по сменам основной темы.
 
 Правила:
 - глава = крупный раздел видео, похожий на авторское оглавление;
 - не ищи Shorts, хайлайты или микро-подтемы;
 - не отделяй отдельный пример или мысль, если они относятся к той же главе;
-- главы должны идти по порядку, не пересекаться и вместе покрывать диапазон блоков;
-- если весь диапазон относится к одной главе, верни один диапазон;
+- ставь новую главу при явной смене предмета разговора, вопроса или этапа объяснения;
+- главы должны идти по порядку, не пересекаться и покрывать диапазон блоков;
+- не склеивай вступление, основную часть и завершение, если они отличаются по роли;
 - start_block_id и end_block_id бери только из списка;
 - end_block_id включается;
 - не пиши title и summary;
@@ -1406,6 +1427,742 @@ def ask_gpt4all_for_chapters_in_block_window(
         })
 
     return valid_chapters
+
+
+def chapter_blocks_text(blocks: List[Dict]) -> str:
+    return "\n".join(format_chapter_block_for_llm(block) for block in blocks)
+
+
+def parse_chapter_block_ranges(parsed: Dict, min_id: int, max_id: int) -> List[Dict]:
+    chapters = parsed.get("chapters") or parsed.get("topics") or []
+
+    if not isinstance(chapters, list):
+        return []
+
+    result = []
+
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+
+        try:
+            start_block_id = int(chapter.get("start_block_id", chapter.get("start_id")))
+            end_block_id = int(chapter.get("end_block_id", chapter.get("end_id")))
+        except Exception:
+            continue
+
+        if end_block_id < start_block_id:
+            start_block_id, end_block_id = end_block_id, start_block_id
+
+        start_block_id = max(min_id, min(start_block_id, max_id))
+        end_block_id = max(min_id, min(end_block_id, max_id))
+
+        result.append({
+            "title": str(chapter.get("title", "")).strip(),
+            "summary": str(chapter.get("summary", "")).strip(),
+            "start_block_id": start_block_id,
+            "end_block_id": end_block_id,
+        })
+
+    return result
+
+
+def ask_gpt4all_for_chapter_outline_from_blocks(
+    model,
+    blocks: List[Dict],
+    include_metadata: bool = False,
+    max_tokens: Optional[int] = None
+) -> List[Dict]:
+    if not blocks:
+        return []
+
+    first_id = int(blocks[0]["id"])
+    last_id = int(blocks[-1]["id"])
+    blocks_text = chapter_blocks_text(blocks)
+
+    metadata_rule = "- title короткий, summary 1 предложение;" if include_metadata else "- не пиши title и summary;"
+    format_json = (
+        f'{{"chapters":[{{"title":"...","summary":"...","start_block_id":{first_id},"end_block_id":{last_id}}}]}}'
+        if include_metadata
+        else f'{{"chapters":[{{"start_block_id":{first_id},"end_block_id":{last_id}}}]}}'
+    )
+
+    prompt = f"""
+Найди главы видео по блокам транскрипта.
+
+Правила:
+- глава = самостоятельный крупный раздел, который можно поставить в оглавление;
+- новая глава начинается при смене основной темы, вопроса, этапа объяснения или роли блока;
+- вступление и завершение выделяй отдельно, если они отличаются от основной темы;
+- не ищи Shorts и не режь на микро-идеи;
+- не объединяй разные темы только потому, что они рядом;
+- количество глав выбери по содержанию, без фиксированного числа;
+- главы должны идти по порядку, не пересекаться и покрывать весь диапазон;
+{metadata_rule}
+- start_block_id и end_block_id бери только из списка;
+- end_block_id включается;
+- ответ только JSON.
+
+Формат:
+{format_json}
+
+Блоки:
+{blocks_text}
+""".strip()
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=int(max_tokens or CHAPTER_OUTLINE_MAX_TOKENS), temp=0.1)
+    except Exception as e:
+        print(f"[WARN] GPT4All full chapter outline failed: {e}")
+        return []
+
+    parsed = extract_json_from_model_answer(answer or "")
+    if not parsed:
+        print("[WARN] Could not parse JSON from full chapter outline")
+        print((answer or "")[:500])
+        return []
+
+    return parse_chapter_block_ranges(parsed, min_id=first_id, max_id=last_id)
+
+
+def summarize_chapter_block_window(model, window_id: int, block_window: List[Dict]) -> Dict:
+    blocks_text = chapter_blocks_text(block_window)
+    first_block_id = int(block_window[0]["id"])
+    last_block_id = int(block_window[-1]["id"])
+
+    prompt = f"""
+Сожми фрагмент транскрипта для последующего построения оглавления видео.
+
+Правила:
+- опиши главную тему окна, а не отдельные фразы;
+- если внутри окна есть заметная смена темы, кратко упомяни ее;
+- не добавляй фактов вне текста;
+- ответ только JSON.
+
+Формат:
+{{"title":"...","summary":"1-2 предложения","keywords":["..."]}}
+
+Блоки {first_block_id}-{last_block_id}:
+{blocks_text}
+""".strip()
+
+    fallback_text = " ".join(block.get("text", "") for block in block_window)
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=CHAPTER_SUMMARY_MAX_TOKENS, temp=0.1)
+    except Exception as e:
+        print(f"[WARN] GPT4All chapter summary failed: {e}")
+        answer = ""
+
+    parsed = extract_json_from_model_answer(answer or "") or {}
+    title = str(parsed.get("title") or make_topic_label(fallback_text, max_words=6).replace("_", " ")).strip()
+    summary = str(parsed.get("summary") or truncate_text_for_llm(fallback_text, 260)).strip()
+    keywords = parsed.get("keywords") if isinstance(parsed.get("keywords"), list) else []
+
+    return {
+        "window_id": window_id,
+        "start_block_id": first_block_id,
+        "end_block_id": last_block_id,
+        "start": float(block_window[0]["start"]),
+        "end": float(block_window[-1]["end"]),
+        "title": title,
+        "summary": summary,
+        "keywords": [str(item).strip() for item in keywords if str(item).strip()][:8],
+    }
+
+
+def format_chapter_summary_for_llm(summary: Dict) -> str:
+    keywords = ", ".join(summary.get("keywords") or [])
+    keyword_part = f" | keywords: {keywords}" if keywords else ""
+    return (
+        f"[{summary['window_id']}] blocks {summary['start_block_id']}-{summary['end_block_id']} "
+        f"{format_timestamp(float(summary['start']))}-{format_timestamp(float(summary['end']))}: "
+        f"{summary.get('title', '')}. {summary.get('summary', '')}{keyword_part}"
+    )
+
+
+def ask_gpt4all_for_chapter_outline_from_summaries(
+    model,
+    summaries: List[Dict],
+    include_metadata: bool = False,
+    max_tokens: Optional[int] = None
+) -> List[Dict]:
+    if not summaries:
+        return []
+
+    summaries_text = "\n".join(format_chapter_summary_for_llm(summary) for summary in summaries)
+    first_window_id = int(summaries[0]["window_id"])
+    last_window_id = int(summaries[-1]["window_id"])
+
+    metadata_rule = "- title короткий, summary 1 предложение;" if include_metadata else "- не пиши title и summary;"
+    format_json = (
+        f'{{"chapters":[{{"title":"...","summary":"...","start_window_id":{first_window_id},"end_window_id":{last_window_id}}}]}}'
+        if include_metadata
+        else f'{{"chapters":[{{"start_window_id":{first_window_id},"end_window_id":{last_window_id}}}]}}'
+    )
+
+    prompt = f"""
+Построй оглавление видео по кратким summaries окон.
+
+Правила:
+- глава = крупный самостоятельный раздел видео;
+- новая глава начинается при смене основной темы, вопроса, этапа объяснения или роли окна;
+- вступление и завершение выделяй отдельно, если они отличаются от основной темы;
+- не ищи Shorts и не режь на микро-идеи;
+- не склеивай разные темы только потому, что они рядом;
+- количество глав выбери по содержанию, без фиксированного числа;
+- главы должны идти по порядку, не пересекаться и покрывать все окна;
+{metadata_rule}
+- start_window_id и end_window_id бери только из списка;
+- end_window_id включается;
+- ответ только JSON.
+
+Формат:
+{format_json}
+
+Summaries:
+{summaries_text}
+""".strip()
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=int(max_tokens or CHAPTER_OUTLINE_MAX_TOKENS), temp=0.1)
+    except Exception as e:
+        print(f"[WARN] GPT4All summary chapter outline failed: {e}")
+        return []
+
+    parsed = extract_json_from_model_answer(answer or "")
+    if not parsed:
+        print("[WARN] Could not parse JSON from summary chapter outline")
+        print((answer or "")[:500])
+        return []
+
+    chapters = parsed.get("chapters") or []
+    if not isinstance(chapters, list):
+        return []
+
+    summaries_by_id = {int(summary["window_id"]): summary for summary in summaries}
+    ranges = []
+
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+
+        try:
+            start_window_id = int(chapter.get("start_window_id", chapter.get("start_id")))
+            end_window_id = int(chapter.get("end_window_id", chapter.get("end_id")))
+        except Exception:
+            continue
+
+        if end_window_id < start_window_id:
+            start_window_id, end_window_id = end_window_id, start_window_id
+
+        start_window_id = max(first_window_id, min(start_window_id, last_window_id))
+        end_window_id = max(first_window_id, min(end_window_id, last_window_id))
+
+        start_summary = summaries_by_id.get(start_window_id)
+        end_summary = summaries_by_id.get(end_window_id)
+
+        if not start_summary or not end_summary:
+            continue
+
+        ranges.append({
+            "title": str(chapter.get("title", "")).strip(),
+            "summary": str(chapter.get("summary", "")).strip(),
+            "start_block_id": int(start_summary["start_block_id"]),
+            "end_block_id": int(end_summary["end_block_id"]),
+            "start_window_id": start_window_id,
+            "end_window_id": end_window_id,
+        })
+
+    return ranges
+
+
+def normalize_chapter_block_ranges(ranges: List[Dict], first_block_id: int, last_block_id: int) -> List[Dict]:
+    if not ranges:
+        return []
+
+    cleaned = []
+
+    for item in ranges:
+        try:
+            start_block_id = int(item["start_block_id"])
+            end_block_id = int(item.get("end_block_id", start_block_id))
+        except Exception:
+            continue
+
+        if end_block_id < start_block_id:
+            start_block_id, end_block_id = end_block_id, start_block_id
+
+        start_block_id = max(first_block_id, min(start_block_id, last_block_id))
+        end_block_id = max(first_block_id, min(end_block_id, last_block_id))
+        item = dict(item)
+        item["start_block_id"] = start_block_id
+        item["end_block_id"] = end_block_id
+        cleaned.append(item)
+
+    if not cleaned:
+        return []
+
+    cleaned.sort(key=lambda item: (int(item["start_block_id"]), int(item["end_block_id"])))
+    starts = [first_block_id]
+    titles = [cleaned[0].get("title", "")]
+    summaries = [cleaned[0].get("summary", "")]
+
+    for item in cleaned[1:]:
+        start_block_id = int(item["start_block_id"])
+        if first_block_id < start_block_id <= last_block_id and start_block_id > starts[-1]:
+            starts.append(start_block_id)
+            titles.append(item.get("title", ""))
+            summaries.append(item.get("summary", ""))
+
+    result = []
+    for index, start_block_id in enumerate(starts):
+        next_start = starts[index + 1] if index + 1 < len(starts) else last_block_id + 1
+        end_block_id = max(start_block_id, next_start - 1)
+        result.append({
+            "start_block_id": start_block_id,
+            "end_block_id": min(end_block_id, last_block_id),
+            "title": titles[index] if index < len(titles) else "",
+            "summary": summaries[index] if index < len(summaries) else "",
+        })
+
+    return result
+
+
+def refine_chapter_boundary_with_llm(
+    model,
+    blocks_by_id: Dict[int, Dict],
+    boundary_block_id: int,
+    min_boundary_id: int,
+    max_boundary_id: int,
+    context_blocks: int = CHAPTER_REFINE_CONTEXT_BLOCKS
+) -> int:
+    context_start = max(min(blocks_by_id), boundary_block_id - context_blocks)
+    context_end = min(max(blocks_by_id), boundary_block_id + context_blocks)
+    context = [blocks_by_id[i] for i in range(context_start, context_end + 1) if i in blocks_by_id]
+
+    if not context:
+        return boundary_block_id
+
+    prompt = f"""
+Уточни границу между двумя соседними главами видео.
+
+Нужно выбрать block_id, с которого начинается НОВАЯ глава.
+
+Правила:
+- выбирай только id из списка;
+- граница должна быть между {min_boundary_id} и {max_boundary_id};
+- если примерная граница уже хорошая, верни {boundary_block_id};
+- ответ только JSON.
+
+Формат:
+{{"boundary_block_id":{boundary_block_id}}}
+
+Блоки вокруг границы:
+{chapter_blocks_text(context)}
+""".strip()
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=80, temp=0.1)
+    except Exception as e:
+        print(f"[WARN] GPT4All chapter boundary refine failed: {e}")
+        return boundary_block_id
+
+    parsed = extract_json_from_model_answer(answer or "") or {}
+
+    try:
+        refined = int(parsed.get("boundary_block_id", boundary_block_id))
+    except Exception:
+        refined = boundary_block_id
+
+    return max(min_boundary_id, min(refined, max_boundary_id))
+
+
+def refine_chapter_block_ranges(
+    model,
+    ranges: List[Dict],
+    blocks_by_id: Dict[int, Dict],
+    progress_callback=None,
+    progress_offset: int = 0,
+    progress_total: int = 1
+) -> List[Dict]:
+    if len(ranges) <= 1:
+        return ranges
+
+    first_block_id = min(blocks_by_id)
+    last_block_id = max(blocks_by_id)
+    starts = [int(ranges[0]["start_block_id"])]
+
+    for index in range(1, len(ranges)):
+        approximate = int(ranges[index]["start_block_id"])
+        min_boundary_id = starts[-1] + 1
+        max_boundary_id = int(ranges[index].get("end_block_id", last_block_id))
+        max_boundary_id = max(min_boundary_id, min(max_boundary_id, last_block_id))
+
+        if progress_callback:
+            progress_callback(
+                progress_offset + index,
+                progress_total,
+                f"Уточняю границу главы {index + 1} из {len(ranges)}"
+            )
+
+        refined = refine_chapter_boundary_with_llm(
+            model=model,
+            blocks_by_id=blocks_by_id,
+            boundary_block_id=approximate,
+            min_boundary_id=min_boundary_id,
+            max_boundary_id=max_boundary_id,
+        )
+        starts.append(refined)
+
+    refined_ranges = []
+    for index, start_block_id in enumerate(starts):
+        next_start = starts[index + 1] if index + 1 < len(starts) else last_block_id + 1
+        source = ranges[index] if index < len(ranges) else {}
+        refined_ranges.append({
+            "start_block_id": max(first_block_id, min(start_block_id, last_block_id)),
+            "end_block_id": min(last_block_id, max(start_block_id, next_start - 1)),
+            "title": source.get("title", ""),
+            "summary": source.get("summary", ""),
+        })
+
+    return normalize_chapter_block_ranges(refined_ranges, first_block_id=first_block_id, last_block_id=last_block_id)
+
+
+def build_chapters_from_block_ranges(
+    ranges: List[Dict],
+    blocks_by_id: Dict[int, Dict],
+    segments_by_id: Dict[int, Dict],
+    min_chapter_duration_sec: float
+) -> List[Dict]:
+    chapters = []
+
+    for item in ranges:
+        start_block = blocks_by_id.get(int(item["start_block_id"]))
+        end_block = blocks_by_id.get(int(item["end_block_id"]))
+
+        if not start_block or not end_block:
+            continue
+
+        chapter = build_topic_from_segment_ids(
+            segments_by_id=segments_by_id,
+            start_id=int(start_block["start_id"]),
+            end_id=int(end_block["end_id"]),
+            title=item.get("title", ""),
+            summary=item.get("summary", "")
+        )
+
+        if not chapter:
+            continue
+
+        if float(chapter["duration"]) < min_chapter_duration_sec and chapters:
+            previous = chapters[-1]
+            merged = build_topic_from_segment_ids(
+                segments_by_id=segments_by_id,
+                start_id=int(previous["start_id"]),
+                end_id=int(chapter["end_id"]),
+                title=previous.get("title", ""),
+                summary=previous.get("summary", "")
+            )
+            if merged:
+                merged["segment_kind"] = "chapter"
+                merged["start_block_id"] = previous.get("start_block_id")
+                merged["end_block_id"] = int(item["end_block_id"])
+                chapters[-1] = merged
+            continue
+
+        chapter["segment_kind"] = "chapter"
+        chapter["start_block_id"] = int(item["start_block_id"])
+        chapter["end_block_id"] = int(item["end_block_id"])
+        chapters.append(chapter)
+
+    return chapters
+
+
+def chaptering_is_too_coarse(chapters: List[Dict], total_duration: float) -> bool:
+    if not chapters:
+        return True
+
+    if total_duration >= 900 and len(chapters) <= 1:
+        return True
+
+    return False
+
+
+def chapter_sensitivity_params(sensitivity: str) -> Dict:
+    sensitivity = (sensitivity or "detailed").strip().lower()
+
+    if sensitivity in {"coarse", "large", "крупные"}:
+        return {
+            "name": "coarse",
+            "label": "крупные главы",
+            "min_confidence": 0.72,
+            "min_gap_blocks": 5,
+            "min_chapter_duration_sec": 90.0,
+            "prompt_hint": "Отмечай только сильные смены основной темы. Лучше меньше глав, но очень уверенных.",
+        }
+
+    if sensitivity in {"balanced", "balance", "баланс"}:
+        return {
+            "name": "balanced",
+            "label": "баланс",
+            "min_confidence": 0.58,
+            "min_gap_blocks": 3,
+            "min_chapter_duration_sec": 45.0,
+            "prompt_hint": "Отмечай заметные смены основной темы или этапа объяснения, но не каждую микро-мысль.",
+        }
+
+    return {
+        "name": "detailed",
+        "label": "подробные главы",
+        "min_confidence": 0.43,
+        "min_gap_blocks": 2,
+        "min_chapter_duration_sec": 20.0,
+        "prompt_hint": "Отмечай даже умеренные смены темы, вопроса, этапа объяснения, вступление и завершение.",
+    }
+
+
+def parse_chapter_boundaries_from_answer(answer: str, min_block_id: int, max_block_id: int) -> List[Dict]:
+    parsed = extract_json_from_model_answer(answer or "")
+    boundaries = []
+
+    if isinstance(parsed, dict):
+        raw_boundaries = parsed.get("boundaries") or parsed.get("chapter_boundaries") or parsed.get("chapters") or []
+    elif isinstance(parsed, list):
+        raw_boundaries = parsed
+    else:
+        raw_boundaries = []
+
+    if isinstance(raw_boundaries, list):
+        for item in raw_boundaries:
+            if not isinstance(item, dict):
+                continue
+
+            raw_id = (
+                item.get("start_block_id")
+                or item.get("boundary_block_id")
+                or item.get("block_id")
+                or item.get("start_id")
+            )
+
+            try:
+                block_id = int(raw_id)
+            except Exception:
+                continue
+
+            if block_id <= min_block_id or block_id > max_block_id:
+                continue
+
+            try:
+                confidence = float(item.get("confidence", item.get("score", 0.65)))
+            except Exception:
+                confidence = 0.65
+
+            boundaries.append({
+                "block_id": block_id,
+                "confidence": max(0.0, min(confidence, 1.0)),
+                "reason": str(item.get("reason", "")).strip(),
+                "source": "llm",
+            })
+
+    if boundaries:
+        return boundaries
+
+    # Last-resort parser for non-JSON answers like "boundaries: 4, 9, 15".
+    for match in re.finditer(r"(?:block|блок|границ[аы]?|boundary)?\s*#?\s*(\d+)", answer or "", flags=re.IGNORECASE):
+        block_id = int(match.group(1))
+        if min_block_id < block_id <= max_block_id:
+            boundaries.append({
+                "block_id": block_id,
+                "confidence": 0.50,
+                "reason": "parsed_from_text",
+                "source": "text_fallback",
+            })
+
+    return boundaries
+
+
+def ask_gpt4all_for_chapter_boundaries_in_window(
+    model,
+    block_window: List[Dict],
+    sensitivity: str = CHAPTER_BOUNDARY_SENSITIVITY,
+    max_tokens: Optional[int] = None
+) -> Tuple[List[Dict], str]:
+    if len(block_window) < 2:
+        return [], ""
+
+    params = chapter_sensitivity_params(sensitivity)
+    first_id = int(block_window[0]["id"])
+    last_id = int(block_window[-1]["id"])
+    blocks_text = chapter_blocks_text(block_window)
+
+    prompt = f"""
+Найди локальные границы глав внутри окна транскрипта.
+
+Задача: указать block_id, С КОТОРОГО начинается новая глава.
+
+Правила:
+- глава = раздел, который можно поставить в оглавление видео;
+- новая глава начинается при смене основной темы, вопроса, этапа объяснения или роли фрагмента;
+- вступление, переход к основной теме и завершение могут быть отдельными главами;
+- не ищи Shorts и не режь каждую фразу;
+- {params['prompt_hint']}
+- не возвращай первый block_id окна ({first_id}), потому что это продолжение контекста;
+- block_id бери только из списка {first_id + 1}..{last_id};
+- confidence: 0.0..1.0, насколько уверена граница;
+- ответ только JSON, без пояснений вне JSON.
+
+Формат:
+{{"boundaries":[{{"start_block_id":{first_id + 1},"confidence":0.75,"reason":"смена темы"}}]}}
+
+Блоки:
+{blocks_text}
+""".strip()
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=int(max_tokens or CHAPTER_BOUNDARY_MAX_TOKENS), temp=0.1)
+    except Exception as e:
+        print(f"[WARN] GPT4All chapter boundary window failed: {e}")
+        return [], ""
+
+    boundaries = parse_chapter_boundaries_from_answer(answer or "", min_block_id=first_id, max_block_id=last_id)
+    if not boundaries and answer:
+        print("[WARN] Could not parse chapter boundaries from answer")
+        print(answer[:500])
+
+    return boundaries, answer or ""
+
+
+def get_heuristic_chapter_boundaries(blocks: List[Dict]) -> List[Dict]:
+    marker_patterns = [
+        r"\bтеперь\b",
+        r"\bдальше\b",
+        r"\bдалее\b",
+        r"\bперейд[её]м\b",
+        r"\bпереходим\b",
+        r"\bследующ",
+        r"\bитак\b",
+        r"\bв заключени",
+        r"\bподвед[её]м итог",
+        r"\bначн[её]м\b",
+        r"\bпоговорим\b",
+        r"\bразбер[её]м\b",
+        r"\bверн[её]мся\b",
+    ]
+    boundaries = []
+
+    for block in blocks[1:]:
+        text = normalize_text(block.get("text", ""))[:180]
+        confidence = 0.0
+        reasons = []
+
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in marker_patterns):
+            confidence += 0.52
+            reasons.append("transition_marker")
+
+        gap_before = block.get("gap_before")
+        try:
+            gap_before = float(gap_before) if gap_before is not None else 0.0
+        except Exception:
+            gap_before = 0.0
+
+        if gap_before >= 1.2:
+            confidence += min(0.22, gap_before / 10.0)
+            reasons.append(f"pause_{gap_before:.1f}s")
+
+        if confidence > 0:
+            boundaries.append({
+                "block_id": int(block["id"]),
+                "confidence": min(confidence, 0.82),
+                "reason": ",".join(reasons),
+                "source": "heuristic",
+            })
+
+    return boundaries
+
+
+def merge_boundary_candidates(candidates: List[Dict]) -> List[Dict]:
+    merged: Dict[int, Dict] = {}
+
+    for candidate in candidates:
+        try:
+            block_id = int(candidate["block_id"])
+        except Exception:
+            continue
+
+        confidence = float(candidate.get("confidence", 0.0) or 0.0)
+        existing = merged.get(block_id)
+
+        if existing is None:
+            merged[block_id] = dict(candidate)
+            merged[block_id]["confidence"] = confidence
+            merged[block_id]["sources"] = [candidate.get("source", "unknown")]
+            continue
+
+        existing["confidence"] = max(float(existing.get("confidence", 0.0)), confidence)
+        existing["reason"] = "; ".join(part for part in [existing.get("reason", ""), candidate.get("reason", "")] if part)
+        sources = set(existing.get("sources") or [])
+        sources.add(candidate.get("source", "unknown"))
+        existing["sources"] = sorted(sources)
+
+    return sorted(merged.values(), key=lambda item: int(item["block_id"]))
+
+
+def filter_chapter_boundaries(
+    candidates: List[Dict],
+    blocks: List[Dict],
+    sensitivity: str = CHAPTER_BOUNDARY_SENSITIVITY
+) -> List[Dict]:
+    params = chapter_sensitivity_params(sensitivity)
+    min_confidence = float(params["min_confidence"])
+    min_gap_blocks = int(params["min_gap_blocks"])
+    first_block_id = int(blocks[0]["id"]) if blocks else 0
+    last_block_id = int(blocks[-1]["id"]) if blocks else 0
+    selected = []
+
+    strong = [
+        candidate
+        for candidate in merge_boundary_candidates(candidates)
+        if first_block_id < int(candidate.get("block_id", first_block_id)) <= last_block_id
+        and float(candidate.get("confidence", 0.0) or 0.0) >= min_confidence
+    ]
+
+    for candidate in strong:
+        block_id = int(candidate["block_id"])
+
+        if selected and block_id - int(selected[-1]["block_id"]) < min_gap_blocks:
+            if float(candidate.get("confidence", 0.0)) > float(selected[-1].get("confidence", 0.0)):
+                selected[-1] = candidate
+            continue
+
+        selected.append(candidate)
+
+    return selected
+
+
+def ranges_from_boundary_ids(boundary_ids: List[int], first_block_id: int, last_block_id: int) -> List[Dict]:
+    starts = [first_block_id]
+
+    for block_id in sorted(set(int(item) for item in boundary_ids)):
+        if first_block_id < block_id <= last_block_id and block_id > starts[-1]:
+            starts.append(block_id)
+
+    ranges = []
+    for index, start_block_id in enumerate(starts):
+        next_start = starts[index + 1] if index + 1 < len(starts) else last_block_id + 1
+        ranges.append({
+            "start_block_id": start_block_id,
+            "end_block_id": max(start_block_id, min(last_block_id, next_start - 1)),
+            "title": "",
+            "summary": "",
+        })
+
+    return ranges
 
 
 def ask_gpt4all_for_topics_in_window(
@@ -1927,12 +2684,14 @@ def llm_chapter_segmentation(
     min_chapter_duration_sec: float = 20.0,
     generate_metadata: bool = False,
     max_tokens: Optional[int] = None,
+    sensitivity: str = CHAPTER_BOUNDARY_SENSITIVITY,
     progress_callback=None
 ) -> List[Dict]:
     """
-    Делит видео на крупные главы. В отличие от llm_topic_segmentation,
-    сначала сжимает ASR в блоки, чтобы LLM видела структуру всего видео.
+    Chaptering v3: ищет локальные границы глав, затем собирает главы из границ.
+    Это устойчивее, чем просить LLM построить всё оглавление одним ответом.
     """
+    LAST_CHAPTERING_DEBUG.clear()
     prepared_segments = prepare_whisper_segments_with_ids(whisper_segments)
 
     if not prepared_segments:
@@ -1950,74 +2709,121 @@ def llm_chapter_segmentation(
     if not blocks:
         return []
 
-    block_windows = split_segments_for_llm_by_count(
-        blocks,
-        max_segments_per_window=max_blocks_per_window,
-        overlap_segments=overlap_blocks
-    )
-
     segments_by_id = {int(seg["id"]): seg for seg in prepared_segments}
     blocks_by_id = {int(block["id"]): block for block in blocks}
-    candidates: List[Dict] = []
-    effective_max_tokens = int(max_tokens or CHAPTER_MAX_TOKENS)
+    first_block_id = int(blocks[0]["id"])
+    last_block_id = int(blocks[-1]["id"])
 
-    for window_index, block_window in enumerate(block_windows, start=1):
+    params = chapter_sensitivity_params(sensitivity)
+    min_duration = max(float(min_chapter_duration_sec), float(params["min_chapter_duration_sec"]))
+    effective_max_tokens = int(max_tokens or CHAPTER_BOUNDARY_MAX_TOKENS)
+    boundary_windows = split_segments_for_llm_by_count(
+        blocks,
+        max_segments_per_window=CHAPTER_BOUNDARY_WINDOW_BLOCKS,
+        overlap_segments=CHAPTER_BOUNDARY_OVERLAP_BLOCKS,
+    )
+    all_candidates = get_heuristic_chapter_boundaries(blocks)
+    raw_answers = []
+
+    if generate_metadata:
+        print("[INFO] Chaptering v3 ignores title/summary during boundary detection; metadata can be generated after boundaries.")
+
+    for window_index, block_window in enumerate(boundary_windows, start=1):
         if progress_callback:
             progress_callback(
                 window_index,
-                len(block_windows),
-                f"ИИ выделяет главы: окно {window_index} из {len(block_windows)}"
+                len(boundary_windows),
+                f"ИИ ищет границы глав: окно {window_index} из {len(boundary_windows)}"
             )
 
-        raw_chapters = ask_gpt4all_for_chapters_in_block_window(
-            model,
-            block_window,
-            include_metadata=generate_metadata,
-            max_tokens=effective_max_tokens
+        boundaries, raw_answer = ask_gpt4all_for_chapter_boundaries_in_window(
+            model=model,
+            block_window=block_window,
+            sensitivity=params["name"],
+            max_tokens=effective_max_tokens,
         )
 
-        for raw in raw_chapters:
-            start_block = blocks_by_id.get(int(raw["start_block_id"]))
-            end_block = blocks_by_id.get(int(raw["end_block_id"]))
+        raw_answers.append({
+            "window_index": window_index,
+            "start_block_id": int(block_window[0]["id"]),
+            "end_block_id": int(block_window[-1]["id"]),
+            "answer": raw_answer[:2000],
+            "boundaries": boundaries,
+        })
+        all_candidates.extend(boundaries)
 
-            if not start_block or not end_block:
-                continue
-
-            chapter = build_topic_from_segment_ids(
-                segments_by_id=segments_by_id,
-                start_id=int(start_block["start_id"]),
-                end_id=int(end_block["end_id"]),
-                title=raw.get("title", ""),
-                summary=raw.get("summary", "")
-            )
-
-            if not chapter:
-                continue
-
-            if float(chapter["duration"]) < min_chapter_duration_sec:
-                continue
-
-            chapter["segment_kind"] = "chapter"
-            chapter["start_block_id"] = int(raw["start_block_id"])
-            chapter["end_block_id"] = int(raw["end_block_id"])
-            candidates.append(chapter)
-
-    chapters = deduplicate_topic_candidates(
-        candidates=candidates,
+    selected_boundaries = filter_chapter_boundaries(
+        candidates=all_candidates,
+        blocks=blocks,
+        sensitivity=params["name"],
+    )
+    boundary_ids = [int(item["block_id"]) for item in selected_boundaries]
+    ranges = ranges_from_boundary_ids(boundary_ids, first_block_id=first_block_id, last_block_id=last_block_id)
+    chapters = build_chapters_from_block_ranges(
+        ranges=ranges,
+        blocks_by_id=blocks_by_id,
         segments_by_id=segments_by_id,
-        min_topic_duration_sec=min_chapter_duration_sec
+        min_chapter_duration_sec=min_duration,
     )
 
     chapters = sorted(chapters, key=lambda x: float(x["start"]))
 
+    # If LLM was too conservative, keep heuristic boundaries as a last-resort recall boost.
+    if chaptering_is_too_coarse(chapters, float(blocks[-1]["end"]) - float(blocks[0]["start"])):
+        heuristic_boundaries = filter_chapter_boundaries(
+            candidates=get_heuristic_chapter_boundaries(blocks),
+            blocks=blocks,
+            sensitivity="detailed",
+        )
+        heuristic_ids = [int(item["block_id"]) for item in heuristic_boundaries]
+        if heuristic_ids:
+            ranges = ranges_from_boundary_ids(heuristic_ids, first_block_id=first_block_id, last_block_id=last_block_id)
+            chapters = build_chapters_from_block_ranges(
+                ranges=ranges,
+                blocks_by_id=blocks_by_id,
+                segments_by_id=segments_by_id,
+                min_chapter_duration_sec=max(20.0, float(min_chapter_duration_sec)),
+            )
+            selected_boundaries = heuristic_boundaries
+
     print(f"[DEBUG] Chapter blocks: {len(blocks)}")
-    print(f"[DEBUG] Chapter windows: {len(block_windows)}")
-    print(f"[DEBUG] Raw chapter candidates: {len(candidates)}")
-    print(f"[DEBUG] Chapters after deduplication: {len(chapters)}")
+    print(f"[DEBUG] Chaptering method: boundary_v3")
+    print(f"[DEBUG] Chaptering sensitivity: {params['name']}")
+    print(f"[DEBUG] Boundary windows: {len(boundary_windows)}")
+    print(f"[DEBUG] Raw boundary candidates: {len(all_candidates)}")
+    print(f"[DEBUG] Selected boundaries: {len(selected_boundaries)}")
+    print(f"[DEBUG] Chapter ranges: {len(ranges)}")
+    print(f"[DEBUG] Chapters after build/refine: {len(chapters)}")
+
+    LAST_CHAPTERING_DEBUG.update({
+        "version": CHAPTERING_VERSION,
+        "method": "boundary_v3",
+        "sensitivity": params,
+        "block_count": len(blocks),
+        "blocks": [
+            {
+                "id": int(block["id"]),
+                "start": float(block["start"]),
+                "end": float(block["end"]),
+                "gap_before": block.get("gap_before"),
+                "text": block.get("text", ""),
+            }
+            for block in blocks
+        ],
+        "boundary_window_count": len(boundary_windows),
+        "raw_candidate_count": len(all_candidates),
+        "raw_candidates": all_candidates,
+        "selected_boundaries": selected_boundaries,
+        "ranges": ranges,
+        "raw_answers": raw_answers,
+    })
 
     for i, chapter in enumerate(chapters, start=1):
         chapter["id"] = i
         chapter["segment_kind"] = "chapter"
+        chapter["chaptering_version"] = CHAPTERING_VERSION
+        chapter["chaptering_method"] = "boundary_v3"
+        chapter["chaptering_sensitivity"] = params["name"]
         chapter["score"] = score_topic_segment_v2(chapter)
 
         print(

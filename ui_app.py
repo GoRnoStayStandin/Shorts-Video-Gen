@@ -19,12 +19,20 @@ from benchmark_tools import (
     FW_GPU_BATCH_SIZE,
     CHAPTER_BLOCK_MAX_CHARS,
     CHAPTER_BLOCK_TARGET_SEC,
+    CHAPTER_BOUNDARY_MAX_TOKENS,
+    CHAPTER_BOUNDARY_OVERLAP_BLOCKS,
+    CHAPTER_BOUNDARY_SENSITIVITY,
+    CHAPTER_BOUNDARY_WINDOW_BLOCKS,
+    CHAPTER_FULL_TRANSCRIPT_MAX_CHARS,
     CHAPTER_MAX_BLOCKS_PER_WINDOW,
     CHAPTER_MAX_TOKENS,
     CHAPTER_OVERLAP_BLOCKS,
+    CHAPTER_SUMMARY_WINDOW_BLOCKS,
+    CHAPTERING_VERSION,
     GPT4ALL_DEVICE,
     GPT4ALL_FAST_TOPIC_MAX_TOKENS,
     GPT4ALL_TOPIC_MAX_TOKENS,
+    LAST_CHAPTERING_DEBUG,
     TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW,
     TOPIC_FAST_OVERLAP_SEGMENTS,
     TOPIC_MAX_SEGMENTS_PER_WINDOW,
@@ -457,6 +465,7 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
 
     topic_mode = st.session_state.get("topic_mode", "fast")
     is_fast_topic_mode = topic_mode == "fast"
+    chapter_sensitivity = str(st.session_state.get("chapter_sensitivity", CHAPTER_BOUNDARY_SENSITIVITY))
 
     if is_fast_topic_mode:
         topic_mode_label = "быстрый"
@@ -468,16 +477,19 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         topic_overlap = TOPIC_OVERLAP_SEGMENTS
 
     generate_metadata = bool(st.session_state.get("generate_topic_metadata", False))
-    metadata_label = "metadata" if generate_metadata else "bounds"
+    effective_generate_metadata = False if is_chapter_goal else generate_metadata
+    metadata_label = "metadata" if effective_generate_metadata else "bounds"
     if is_chapter_goal:
-        topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else CHAPTER_MAX_TOKENS
+        topic_max_tokens = CHAPTER_BOUNDARY_MAX_TOKENS
     else:
-        topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
+        topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if effective_generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
 
     selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
     selected_model_name = Path(selected_model_path).stem
     model_cache_key = ui_safe_filename(selected_model_name, max_len=70)
-    topic_cache_path = topic_dir / f"topic_segments_{segmentation_goal}_{topic_mode}_{metadata_label}_{model_cache_key}.json"
+    segmentation_cache_version = CHAPTERING_VERSION if is_chapter_goal else "topics_v1"
+    sensitivity_cache_part = f"_{chapter_sensitivity}" if is_chapter_goal else ""
+    topic_cache_path = topic_dir / f"topic_segments_{segmentation_goal}_{segmentation_cache_version}{sensitivity_cache_part}_{topic_mode}_{metadata_label}_{model_cache_key}.json"
 
     cached_topics = read_json_if_exists(str(topic_cache_path))
 
@@ -527,8 +539,9 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
                 max_blocks_per_window=CHAPTER_MAX_BLOCKS_PER_WINDOW,
                 overlap_blocks=CHAPTER_OVERLAP_BLOCKS,
                 min_chapter_duration_sec=20.0,
-                generate_metadata=generate_metadata,
+                generate_metadata=False,
                 max_tokens=topic_max_tokens,
+                sensitivity=chapter_sensitivity,
                 progress_callback=topic_progress
             )
         else:
@@ -540,7 +553,7 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
                 min_topic_duration_sec=8.0,
                 max_topic_duration_sec=240.0,
                 fast_mode=is_fast_topic_mode,
-                generate_metadata=generate_metadata,
+                generate_metadata=effective_generate_metadata,
                 topic_max_tokens=topic_max_tokens,
                 progress_callback=topic_progress
             )
@@ -566,6 +579,8 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         topic_dir / "topic_segmentation_settings.json",
         {
             "segmentation_goal": segmentation_goal,
+            "segmentation_cache_version": segmentation_cache_version,
+            "chaptering_version": CHAPTERING_VERSION if is_chapter_goal else None,
             "goal_label": goal_label,
             "mode": topic_mode,
             "mode_label": topic_mode_label,
@@ -575,13 +590,22 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
             "chapter_block_max_chars": CHAPTER_BLOCK_MAX_CHARS if is_chapter_goal else None,
             "chapter_max_blocks_per_window": CHAPTER_MAX_BLOCKS_PER_WINDOW if is_chapter_goal else None,
             "chapter_overlap_blocks": CHAPTER_OVERLAP_BLOCKS if is_chapter_goal else None,
+            "chapter_boundary_window_blocks": CHAPTER_BOUNDARY_WINDOW_BLOCKS if is_chapter_goal else None,
+            "chapter_boundary_overlap_blocks": CHAPTER_BOUNDARY_OVERLAP_BLOCKS if is_chapter_goal else None,
+            "chapter_boundary_sensitivity": chapter_sensitivity if is_chapter_goal else None,
+            "chapter_full_transcript_max_chars": CHAPTER_FULL_TRANSCRIPT_MAX_CHARS if is_chapter_goal else None,
+            "chapter_summary_window_blocks": CHAPTER_SUMMARY_WINDOW_BLOCKS if is_chapter_goal else None,
             "max_tokens": topic_max_tokens,
             "fast_mode": is_fast_topic_mode,
-            "generate_metadata": generate_metadata,
+            "generate_metadata_requested": generate_metadata,
+            "generate_metadata_effective": effective_generate_metadata,
             "model_path": selected_model_path,
             "model_name": selected_model_name,
         }
     )
+
+    if is_chapter_goal and LAST_CHAPTERING_DEBUG:
+        save_json(topic_dir / "debug_chaptering_v3.json", LAST_CHAPTERING_DEBUG)
 
     st.session_state.topic_segments = enriched
     st.session_state.selected_position = 0
@@ -1148,6 +1172,148 @@ def render_workspace():
             st.caption("Предпросмотр выбранного клипа")
             st.video(str(current_preview))
 
+    if is_chapter_goal:
+        render_chapter_debug_panel(Path(st.session_state.project_dir))
+
+
+def load_chapter_debug(project_dir: Path):
+    debug_path = project_dir / "topic_segmentation" / "debug_chaptering_v3.json"
+    data = read_json_if_exists(str(debug_path))
+
+    if isinstance(data, dict):
+        return debug_path, data
+
+    return debug_path, None
+
+
+def format_boundary_sources(boundary: dict) -> str:
+    sources = boundary.get("sources") or []
+    if not sources and boundary.get("source"):
+        sources = [boundary.get("source")]
+    return ", ".join(str(item) for item in sources if str(item).strip()) or "unknown"
+
+
+def render_chapter_debug_panel(project_dir: Path):
+    debug_path, debug_data = load_chapter_debug(project_dir)
+
+    with st.expander("Диагностика границ глав", expanded=False):
+        if not debug_data:
+            st.info(f"Debug-файл пока не найден: `{debug_path}`")
+            return
+
+        blocks = debug_data.get("blocks") or []
+        selected_boundaries = debug_data.get("selected_boundaries") or []
+        raw_candidates = debug_data.get("raw_candidates") or []
+        raw_answers = debug_data.get("raw_answers") or []
+        ranges = debug_data.get("ranges") or []
+        sensitivity = debug_data.get("sensitivity") or {}
+        blocks_by_id = {int(block.get("id")): block for block in blocks if "id" in block}
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Блоков", debug_data.get("block_count", len(blocks)))
+        c2.metric("Окон LLM", debug_data.get("boundary_window_count", len(raw_answers)))
+        c3.metric("Кандидатов", debug_data.get("raw_candidate_count", len(raw_candidates)))
+        c4.metric("Выбрано границ", len(selected_boundaries))
+
+        st.caption(
+            f"Версия `{debug_data.get('version', 'unknown')}`, метод `{debug_data.get('method', 'unknown')}`, "
+            f"чувствительность `{sensitivity.get('name', 'unknown')}`. Debug: `{debug_path}`"
+        )
+
+        if selected_boundaries:
+            boundary_rows = []
+            for index, boundary in enumerate(selected_boundaries, start=1):
+                block_id = int(boundary.get("block_id", 0))
+                block = blocks_by_id.get(block_id, {})
+                boundary_rows.append({
+                    "#": index,
+                    "block_id": block_id,
+                    "time": format_timestamp(block.get("start", 0)),
+                    "confidence": round(float(boundary.get("confidence", 0) or 0), 3),
+                    "sources": format_boundary_sources(boundary),
+                    "reason": boundary.get("reason", ""),
+                    "block_text": str(block.get("text", ""))[:160],
+                })
+
+            st.write("Выбранные границы")
+            st.dataframe(boundary_rows, use_container_width=True, hide_index=True)
+
+            boundary_options = [
+                f"#{row['#']} · block {row['block_id']} · {row['time']} · conf {row['confidence']}"
+                for row in boundary_rows
+            ]
+            selected_boundary_label = st.selectbox("Контекст вокруг границы", boundary_options)
+            selected_boundary_index = boundary_options.index(selected_boundary_label)
+            selected_block_id = int(boundary_rows[selected_boundary_index]["block_id"])
+            context_radius = st.slider("Блоков вокруг границы", 1, 8, 3, key="chapter_debug_context_radius")
+
+            context_rows = []
+            for block_id in range(selected_block_id - context_radius, selected_block_id + context_radius + 1):
+                block = blocks_by_id.get(block_id)
+                if not block:
+                    continue
+
+                context_rows.append({
+                    "mark": "START" if block_id == selected_block_id else "",
+                    "block_id": block_id,
+                    "time": f"{format_timestamp(block.get('start', 0))}-{format_timestamp(block.get('end', 0))}",
+                    "gap_before": "" if block.get("gap_before") is None else round(float(block.get("gap_before") or 0), 2),
+                    "text": block.get("text", ""),
+                })
+
+            st.dataframe(context_rows, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Выбранных границ нет. Проверь raw-ответы и кандидаты ниже.")
+
+        if ranges:
+            range_rows = [
+                {
+                    "#": index,
+                    "start_block": item.get("start_block_id"),
+                    "end_block": item.get("end_block_id"),
+                    "start_time": format_timestamp(blocks_by_id.get(int(item.get("start_block_id", 0)), {}).get("start", 0)),
+                    "end_time": format_timestamp(blocks_by_id.get(int(item.get("end_block_id", 0)), {}).get("end", 0)),
+                }
+                for index, item in enumerate(ranges, start=1)
+            ]
+            st.write("Собранные диапазоны глав")
+            st.dataframe(range_rows, use_container_width=True, hide_index=True)
+
+        with st.expander("Все кандидаты границ", expanded=False):
+            candidate_rows = []
+            for candidate in raw_candidates:
+                block_id = int(candidate.get("block_id", 0))
+                block = blocks_by_id.get(block_id, {})
+                candidate_rows.append({
+                    "block_id": block_id,
+                    "time": format_timestamp(block.get("start", 0)),
+                    "confidence": round(float(candidate.get("confidence", 0) or 0), 3),
+                    "sources": format_boundary_sources(candidate),
+                    "reason": candidate.get("reason", ""),
+                })
+
+            if candidate_rows:
+                st.dataframe(candidate_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("Кандидаты не сохранены или не найдены.")
+
+        with st.expander("Raw-ответы LLM", expanded=False):
+            if not raw_answers:
+                st.info("Raw-ответов нет.")
+            else:
+                answer_labels = [
+                    f"Окно {item.get('window_index')} · blocks {item.get('start_block_id')}-{item.get('end_block_id')}"
+                    for item in raw_answers
+                ]
+                selected_answer_label = st.selectbox("LLM-ответ", answer_labels, key="chapter_debug_raw_answer_select")
+                selected_answer = raw_answers[answer_labels.index(selected_answer_label)]
+                st.text_area(
+                    "Ответ модели",
+                    value=selected_answer.get("answer", ""),
+                    height=220,
+                    key="chapter_debug_raw_answer_text"
+                )
+
 
 def decode_uploaded_text(uploaded_file) -> str:
     raw = uploaded_file.getvalue()
@@ -1300,6 +1466,22 @@ def render_timestamp_evaluation():
         reference = sources[option_labels.index(reference_label)]["intervals"]
         prediction = sources[option_labels.index(prediction_label)]["intervals"]
 
+        quick_rows = []
+        for quick_iou in (0.30, 0.50, 0.70):
+            quick_result = evaluate_segments(reference, prediction, iou_threshold=quick_iou)
+            quick_rows.append({
+                "IoU": f"{quick_iou:.2f}",
+                "TP": quick_result["tp"],
+                "FP": quick_result["fp"],
+                "FN": quick_result["fn"],
+                "Precision": round(quick_result["precision"], 3),
+                "Recall": round(quick_result["recall"], 3),
+                "F1": round(quick_result["f1"], 3),
+            })
+
+        st.write("Быстрое сравнение по порогам IoU")
+        st.dataframe(quick_rows, use_container_width=True, hide_index=True)
+
         if st.button("Посчитать F1", type="primary", use_container_width=True):
             result = evaluate_segments(reference, prediction, iou_threshold=iou_threshold)
 
@@ -1436,6 +1618,30 @@ segmentation_goal_label = st.radio(
 )
 selected_segmentation_goal = "chapters" if segmentation_goal_label == "Главы видео" else "topics"
 
+previous_chapter_sensitivity = st.session_state.get("chapter_sensitivity", CHAPTER_BOUNDARY_SENSITIVITY)
+chapter_sensitivity_labels = {
+    "detailed": "Подробные",
+    "balanced": "Баланс",
+    "coarse": "Крупные",
+}
+chapter_sensitivity_by_label = {label: key for key, label in chapter_sensitivity_labels.items()}
+
+if selected_segmentation_goal == "chapters":
+    previous_chapter_label = chapter_sensitivity_labels.get(previous_chapter_sensitivity, "Подробные")
+    selected_chapter_label = st.radio(
+        "Чувствительность глав",
+        options=["Подробные", "Баланс", "Крупные"],
+        index=["Подробные", "Баланс", "Крупные"].index(previous_chapter_label),
+        horizontal=True,
+        help=(
+            "Подробные повышают Recall и чаще находят переходы. "
+            "Крупные оставляют только сильные смены темы."
+        )
+    )
+    selected_chapter_sensitivity = chapter_sensitivity_by_label[selected_chapter_label]
+else:
+    selected_chapter_sensitivity = previous_chapter_sensitivity
+
 topic_mode_label = st.radio(
     "Режим ИИ-сегментации",
     options=["Быстрый", "Качественный"],
@@ -1454,26 +1660,31 @@ generate_topic_metadata = st.checkbox(
     help="Если выключено, GPT4All ищет только границы. Название и summary можно сгенерировать позже для выбранного фрагмента."
 )
 
+if selected_segmentation_goal == "chapters" and generate_topic_metadata:
+    st.info("Для режима глав поиск границ всегда выполняется без title/summary. Описания можно сгенерировать после выбора главы.")
+
 goal_changed = previous_segmentation_goal != selected_segmentation_goal
+chapter_sensitivity_changed = previous_chapter_sensitivity != selected_chapter_sensitivity
 mode_changed = st.session_state.get("topic_mode") and st.session_state.topic_mode != selected_topic_mode
 metadata_changed = (
     "generate_topic_metadata" in st.session_state
     and st.session_state.generate_topic_metadata != generate_topic_metadata
 )
 
-if goal_changed or mode_changed or metadata_changed or model_changed:
+if goal_changed or chapter_sensitivity_changed or mode_changed or metadata_changed or model_changed:
     for key in ["topic_segments", "selected_position", "generated_srt_by_clip", "exported_clip_by_clip", "preview_clip_by_clip"]:
         st.session_state.pop(key, None)
 
 st.session_state.segmentation_goal = selected_segmentation_goal
+st.session_state.chapter_sensitivity = selected_chapter_sensitivity
 st.session_state.topic_mode = selected_topic_mode
 st.session_state.generate_topic_metadata = generate_topic_metadata
 
 if selected_segmentation_goal == "chapters":
     st.caption(
-        f"Главы: ASR сжимается в блоки по `{CHAPTER_BLOCK_TARGET_SEC}` сек., "
-        f"до `{CHAPTER_BLOCK_MAX_CHARS}` символов на блок; окно `{CHAPTER_MAX_BLOCKS_PER_WINDOW}` блоков, "
-        f"overlap `{CHAPTER_OVERLAP_BLOCKS}`, max tokens `{CHAPTER_MAX_TOKENS}`. "
+        f"Главы `{CHAPTERING_VERSION}`: ASR сжимается в блоки по `{CHAPTER_BLOCK_TARGET_SEC}` сек., "
+        f"до `{CHAPTER_BLOCK_MAX_CHARS}` символов на блок. LLM ищет локальные границы в окнах "
+        f"по `{CHAPTER_BOUNDARY_WINDOW_BLOCKS}` блоков, overlap `{CHAPTER_BOUNDARY_OVERLAP_BLOCKS}`. "
         "Этот режим используйте для F1 по таймингам глав."
     )
 elif selected_topic_mode == "fast":
