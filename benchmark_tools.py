@@ -147,6 +147,8 @@ CHAPTER_BOUNDARY_WINDOW_BLOCKS = get_env_int("CHAPTER_BOUNDARY_WINDOW_BLOCKS", 1
 CHAPTER_BOUNDARY_OVERLAP_BLOCKS = get_env_int("CHAPTER_BOUNDARY_OVERLAP_BLOCKS", 4)
 CHAPTER_BOUNDARY_MAX_TOKENS = get_env_int("CHAPTER_BOUNDARY_MAX_TOKENS", 320)
 CHAPTER_BOUNDARY_SENSITIVITY = os.getenv("CHAPTER_BOUNDARY_SENSITIVITY", "detailed").strip().lower()
+CHAPTER_SEGMENT_REFINE_CONTEXT = get_env_int("CHAPTER_SEGMENT_REFINE_CONTEXT", 10)
+CHAPTER_SEGMENT_REFINE_MAX_TOKENS = get_env_int("CHAPTER_SEGMENT_REFINE_MAX_TOKENS", 90)
 
 # Экспорт клипов. Если NVENC недоступен, код автоматически откатится на libx264.
 USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
@@ -2165,6 +2167,195 @@ def ranges_from_boundary_ids(boundary_ids: List[int], first_block_id: int, last_
     return ranges
 
 
+def format_segment_with_time_for_boundary(seg: Dict) -> str:
+    return (
+        f"[{seg['id']}] "
+        f"{format_timestamp(float(seg['start']))}-{format_timestamp(float(seg['end']))}: "
+        f"{seg.get('text', '')}"
+    )
+
+
+def parse_refined_segment_id(answer: str, fallback_id: int, min_id: int, max_id: int) -> int:
+    parsed = extract_json_from_model_answer(answer or "")
+
+    if isinstance(parsed, dict):
+        raw_id = parsed.get("start_segment_id") or parsed.get("segment_id") or parsed.get("start_id")
+        try:
+            segment_id = int(raw_id)
+            return max(min_id, min(segment_id, max_id))
+        except Exception:
+            pass
+
+    match = re.search(r"(?:start_segment_id|segment_id|start_id|segment|сегмент)\D+(\d+)", answer or "", flags=re.IGNORECASE)
+    if match:
+        try:
+            segment_id = int(match.group(1))
+            return max(min_id, min(segment_id, max_id))
+        except Exception:
+            pass
+
+    return max(min_id, min(int(fallback_id), max_id))
+
+
+def refine_chapter_boundary_to_segment(
+    model,
+    boundary: Dict,
+    blocks_by_id: Dict[int, Dict],
+    segments_by_id: Dict[int, Dict],
+    context_segments: int = CHAPTER_SEGMENT_REFINE_CONTEXT
+) -> Dict:
+    block_id = int(boundary.get("block_id", 0))
+    block = blocks_by_id.get(block_id)
+
+    if not block:
+        return {**boundary, "refined_segment_id": None, "refined_error": "block_not_found"}
+
+    fallback_segment_id = int(block.get("start_id", 0))
+    min_segment_id = min(segments_by_id)
+    max_segment_id = max(segments_by_id)
+    context_start = max(min_segment_id, fallback_segment_id - max(1, int(context_segments)))
+    context_end = min(max_segment_id, fallback_segment_id + max(1, int(context_segments)))
+    context = [segments_by_id[i] for i in range(context_start, context_end + 1) if i in segments_by_id]
+
+    if not context:
+        return {**boundary, "refined_segment_id": fallback_segment_id, "refined_source": "fallback_empty_context"}
+
+    prompt = f"""
+Уточни точную границу между двумя главами видео.
+
+Нужно выбрать segment_id, С КОТОРОГО начинается новая глава.
+
+Правила:
+- выбирай только id из списка;
+- не начинай главу с середины предложения, если рядом есть начало фразы;
+- если примерная граница уже хорошая, верни {fallback_segment_id};
+- ответ только JSON, без пояснений.
+
+Формат:
+{{"start_segment_id":{fallback_segment_id}}}
+
+Контекст ASR вокруг границы block {block_id}:
+{chr(10).join(format_segment_with_time_for_boundary(seg) for seg in context)}
+""".strip()
+
+    try:
+        with model.chat_session():
+            answer = model.generate(prompt, max_tokens=CHAPTER_SEGMENT_REFINE_MAX_TOKENS, temp=0.1)
+    except Exception as e:
+        refined_id = fallback_segment_id
+        answer = ""
+        error = str(e)
+    else:
+        refined_id = parse_refined_segment_id(
+            answer=answer or "",
+            fallback_id=fallback_segment_id,
+            min_id=context_start,
+            max_id=context_end,
+        )
+        error = None
+
+    refined_seg = segments_by_id.get(refined_id) or segments_by_id.get(fallback_segment_id)
+    result = dict(boundary)
+    result.update({
+        "refined_segment_id": refined_id,
+        "refined_time": float(refined_seg.get("start", 0.0)) if refined_seg else None,
+        "refined_text": str(refined_seg.get("text", ""))[:220] if refined_seg else "",
+        "refine_context_start_id": context_start,
+        "refine_context_end_id": context_end,
+        "refine_answer": (answer or "")[:1000],
+        "refine_error": error,
+    })
+    return result
+
+
+def refine_chapter_boundaries_to_segments(
+    model,
+    boundaries: List[Dict],
+    blocks_by_id: Dict[int, Dict],
+    segments_by_id: Dict[int, Dict],
+    progress_callback=None,
+    progress_start: int = 0,
+    progress_total: int = 1
+) -> List[Dict]:
+    refined = []
+
+    for index, boundary in enumerate(boundaries, start=1):
+        if progress_callback:
+            progress_callback(
+                progress_start + index,
+                progress_total,
+                f"Уточняю точную границу главы {index} из {len(boundaries)}"
+            )
+
+        refined.append(refine_chapter_boundary_to_segment(
+            model=model,
+            boundary=boundary,
+            blocks_by_id=blocks_by_id,
+            segments_by_id=segments_by_id,
+        ))
+
+    return refined
+
+
+def ranges_from_segment_boundary_ids(boundary_segment_ids: List[int], first_segment_id: int, last_segment_id: int) -> List[Dict]:
+    starts = [first_segment_id]
+
+    for segment_id in sorted(set(int(item) for item in boundary_segment_ids)):
+        if first_segment_id < segment_id <= last_segment_id and segment_id > starts[-1]:
+            starts.append(segment_id)
+
+    ranges = []
+    for index, start_segment_id in enumerate(starts):
+        next_start = starts[index + 1] if index + 1 < len(starts) else last_segment_id + 1
+        ranges.append({
+            "start_id": start_segment_id,
+            "end_id": max(start_segment_id, min(last_segment_id, next_start - 1)),
+            "title": "",
+            "summary": "",
+        })
+
+    return ranges
+
+
+def build_chapters_from_segment_ranges(
+    ranges: List[Dict],
+    segments_by_id: Dict[int, Dict],
+    min_chapter_duration_sec: float
+) -> List[Dict]:
+    chapters = []
+
+    for item in ranges:
+        chapter = build_topic_from_segment_ids(
+            segments_by_id=segments_by_id,
+            start_id=int(item["start_id"]),
+            end_id=int(item["end_id"]),
+            title=item.get("title", ""),
+            summary=item.get("summary", ""),
+        )
+
+        if not chapter:
+            continue
+
+        if float(chapter["duration"]) < min_chapter_duration_sec and chapters:
+            previous = chapters[-1]
+            merged = build_topic_from_segment_ids(
+                segments_by_id=segments_by_id,
+                start_id=int(previous["start_id"]),
+                end_id=int(chapter["end_id"]),
+                title=previous.get("title", ""),
+                summary=previous.get("summary", ""),
+            )
+            if merged:
+                merged["segment_kind"] = "chapter"
+                chapters[-1] = merged
+            continue
+
+        chapter["segment_kind"] = "chapter"
+        chapters.append(chapter)
+
+    return chapters
+
+
 def ask_gpt4all_for_topics_in_window(
     model,
     window_segments: List[Dict],
@@ -2757,11 +2948,24 @@ def llm_chapter_segmentation(
         blocks=blocks,
         sensitivity=params["name"],
     )
-    boundary_ids = [int(item["block_id"]) for item in selected_boundaries]
-    ranges = ranges_from_boundary_ids(boundary_ids, first_block_id=first_block_id, last_block_id=last_block_id)
-    chapters = build_chapters_from_block_ranges(
-        ranges=ranges,
+    refine_progress_total = len(boundary_windows) + max(1, len(selected_boundaries))
+    selected_boundaries = refine_chapter_boundaries_to_segments(
+        model=model,
+        boundaries=selected_boundaries,
         blocks_by_id=blocks_by_id,
+        segments_by_id=segments_by_id,
+        progress_callback=progress_callback,
+        progress_start=len(boundary_windows),
+        progress_total=refine_progress_total,
+    )
+    boundary_segment_ids = [int(item["refined_segment_id"]) for item in selected_boundaries if item.get("refined_segment_id") is not None]
+    ranges = ranges_from_segment_boundary_ids(
+        boundary_segment_ids,
+        first_segment_id=min(segments_by_id),
+        last_segment_id=max(segments_by_id),
+    )
+    chapters = build_chapters_from_segment_ranges(
+        ranges=ranges,
         segments_by_id=segments_by_id,
         min_chapter_duration_sec=min_duration,
     )
@@ -2777,14 +2981,23 @@ def llm_chapter_segmentation(
         )
         heuristic_ids = [int(item["block_id"]) for item in heuristic_boundaries]
         if heuristic_ids:
-            ranges = ranges_from_boundary_ids(heuristic_ids, first_block_id=first_block_id, last_block_id=last_block_id)
-            chapters = build_chapters_from_block_ranges(
-                ranges=ranges,
+            selected_boundaries = refine_chapter_boundaries_to_segments(
+                model=model,
+                boundaries=heuristic_boundaries,
                 blocks_by_id=blocks_by_id,
+                segments_by_id=segments_by_id,
+            )
+            boundary_segment_ids = [int(item["refined_segment_id"]) for item in selected_boundaries if item.get("refined_segment_id") is not None]
+            ranges = ranges_from_segment_boundary_ids(
+                boundary_segment_ids,
+                first_segment_id=min(segments_by_id),
+                last_segment_id=max(segments_by_id),
+            )
+            chapters = build_chapters_from_segment_ranges(
+                ranges=ranges,
                 segments_by_id=segments_by_id,
                 min_chapter_duration_sec=max(20.0, float(min_chapter_duration_sec)),
             )
-            selected_boundaries = heuristic_boundaries
 
     print(f"[DEBUG] Chapter blocks: {len(blocks)}")
     print(f"[DEBUG] Chaptering method: boundary_v3")
@@ -2792,6 +3005,7 @@ def llm_chapter_segmentation(
     print(f"[DEBUG] Boundary windows: {len(boundary_windows)}")
     print(f"[DEBUG] Raw boundary candidates: {len(all_candidates)}")
     print(f"[DEBUG] Selected boundaries: {len(selected_boundaries)}")
+    print(f"[DEBUG] Refined segment boundaries: {len(boundary_segment_ids)}")
     print(f"[DEBUG] Chapter ranges: {len(ranges)}")
     print(f"[DEBUG] Chapters after build/refine: {len(chapters)}")
 
@@ -2814,7 +3028,15 @@ def llm_chapter_segmentation(
         "raw_candidate_count": len(all_candidates),
         "raw_candidates": all_candidates,
         "selected_boundaries": selected_boundaries,
-        "ranges": ranges,
+        "boundary_segment_ids": boundary_segment_ids,
+        "ranges": [
+            {
+                **item,
+                "start": float(segments_by_id[int(item["start_id"])] ["start"]) if int(item.get("start_id", -1)) in segments_by_id else None,
+                "end": float(segments_by_id[int(item["end_id"])] ["end"]) if int(item.get("end_id", -1)) in segments_by_id else None,
+            }
+            for item in ranges
+        ],
         "raw_answers": raw_answers,
     })
 

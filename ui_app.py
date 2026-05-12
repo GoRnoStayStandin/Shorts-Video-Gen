@@ -423,6 +423,220 @@ def build_timeline_html(segments, duration, selected_clip_id=None, timeline_titl
     """
 
 
+def build_eval_comparison_timeline_html(reference, prediction, duration, iou_threshold=0.5):
+    if not duration or duration <= 0:
+        return "<p>Нет данных для сравнительного таймлайна</p>"
+
+    result = evaluate_segments(reference, prediction, iou_threshold=iou_threshold)
+    matched_ref_ids = {id(match["reference"]) for match in result["matches"]}
+    matched_pred_ids = {id(match["prediction"]) for match in result["matches"]}
+    ref_iou_by_id = {id(match["reference"]): float(match["iou"]) for match in result["matches"]}
+    pred_iou_by_id = {id(match["prediction"]): float(match["iou"]) for match in result["matches"]}
+
+    def marker_html(items, matched_ids, iou_by_id, kind):
+        markers = []
+
+        for index, item in enumerate(items, start=1):
+            start = max(0.0, float(item.get("start", 0) or 0))
+            end = max(start, float(item.get("end", start) or start))
+
+            if end <= start:
+                continue
+
+            left = max(0.0, min(100.0, start / duration * 100.0))
+            width = max(0.35, min(100.0 - left, (end - start) / duration * 100.0))
+            is_match = id(item) in matched_ids
+            iou = iou_by_id.get(id(item))
+
+            if kind == "reference":
+                color = "#16a34a" if is_match else "#f97316"
+                status = "TP" if is_match else "FN"
+            else:
+                color = "#2563eb" if is_match else "#dc2626"
+                status = "TP" if is_match else "FP"
+
+            label = str(item.get("label") or f"{kind} {index}").strip()
+            short_label = html.escape(label[:30] + ("..." if len(label) > 30 else ""))
+            tooltip_parts = [
+                status,
+                label,
+                f"{format_eval_timestamp(start)} - {format_eval_timestamp(end)}",
+                f"duration {(end - start):.1f}s",
+            ]
+
+            if iou is not None:
+                tooltip_parts.append(f"IoU {iou:.3f}")
+
+            tooltip = html.escape(" | ".join(tooltip_parts))
+
+            markers.append(f"""
+            <div
+                class="eval-segment eval-segment-{status.lower()}"
+                title="{tooltip}"
+                style="left:{left:.3f}%; width:{width:.3f}%; background:{color};"
+            >
+                <span>{html.escape(status)}</span>
+                <em>{short_label}</em>
+            </div>
+            """)
+
+        return "\n".join(markers)
+
+    tick_0 = "0:00"
+    tick_25 = format_eval_timestamp(duration * 0.25)
+    tick_50 = format_eval_timestamp(duration * 0.50)
+    tick_75 = format_eval_timestamp(duration * 0.75)
+    tick_100 = format_eval_timestamp(duration)
+
+    reference_markers = marker_html(reference, matched_ref_ids, ref_iou_by_id, "reference")
+    prediction_markers = marker_html(prediction, matched_pred_ids, pred_iou_by_id, "prediction")
+
+    return f"""
+    <style>
+        .eval-timeline-box {{
+            width: 100%;
+            border: 1px solid #d0d7de;
+            border-radius: 14px;
+            padding: 16px 18px 12px 18px;
+            background: #ffffff;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }}
+
+        .eval-title {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+            color: #111827;
+            font-size: 15px;
+            font-weight: 700;
+        }}
+
+        .eval-legend {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            font-size: 12px;
+            color: #4b5563;
+            font-weight: 500;
+        }}
+
+        .eval-dot {{
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            margin-right: 4px;
+            vertical-align: -1px;
+        }}
+
+        .eval-row {{
+            display: grid;
+            grid-template-columns: 88px 1fr;
+            gap: 12px;
+            align-items: center;
+            margin: 10px 0;
+        }}
+
+        .eval-row-label {{
+            font-size: 13px;
+            font-weight: 700;
+            color: #374151;
+            text-align: right;
+        }}
+
+        .eval-track {{
+            position: relative;
+            height: 56px;
+            border-radius: 12px;
+            overflow: hidden;
+            background: repeating-linear-gradient(
+                90deg,
+                #f8fafc 0,
+                #f8fafc 24.6%,
+                #eef2f7 25%,
+                #f8fafc 25.4%
+            );
+            border: 1px solid #cbd5e1;
+        }}
+
+        .eval-segment {{
+            position: absolute;
+            top: 10px;
+            height: 36px;
+            border-radius: 8px;
+            color: #ffffff;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.18);
+            overflow: hidden;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 0 7px;
+            box-sizing: border-box;
+            font-size: 11px;
+            line-height: 1;
+        }}
+
+        .eval-segment span {{
+            font-weight: 800;
+            letter-spacing: 0.02em;
+        }}
+
+        .eval-segment em {{
+            font-style: normal;
+            opacity: 0.92;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+
+        .eval-ticks {{
+            position: relative;
+            height: 24px;
+            margin-left: 100px;
+            margin-top: 8px;
+            color: #6b7280;
+            font-size: 12px;
+        }}
+
+        .eval-tick {{
+            position: absolute;
+            transform: translateX(-50%);
+            white-space: nowrap;
+        }}
+    </style>
+
+    <div class="eval-timeline-box">
+        <div class="eval-title">
+            <div>Сравнение таймингов при IoU {iou_threshold:.2f}</div>
+            <div class="eval-legend">
+                <span><i class="eval-dot" style="background:#16a34a"></i>Эталон TP</span>
+                <span><i class="eval-dot" style="background:#f97316"></i>Эталон FN</span>
+                <span><i class="eval-dot" style="background:#2563eb"></i>ИИ TP</span>
+                <span><i class="eval-dot" style="background:#dc2626"></i>ИИ FP</span>
+            </div>
+        </div>
+        <div class="eval-row">
+            <div class="eval-row-label">Эталон</div>
+            <div class="eval-track">{reference_markers}</div>
+        </div>
+        <div class="eval-row">
+            <div class="eval-row-label">ИИ</div>
+            <div class="eval-track">{prediction_markers}</div>
+        </div>
+        <div class="eval-ticks">
+            <span class="eval-tick" style="left:0%; transform:translateX(0);">{tick_0}</span>
+            <span class="eval-tick" style="left:25%;">{tick_25}</span>
+            <span class="eval-tick" style="left:50%;">{tick_50}</span>
+            <span class="eval-tick" style="left:75%;">{tick_75}</span>
+            <span class="eval-tick" style="left:100%; transform:translateX(-100%);">{tick_100}</span>
+        </div>
+    </div>
+    """
+
+
 # =========================
 # PIPELINE
 # =========================
@@ -1229,9 +1443,12 @@ def render_chapter_debug_panel(project_dir: Path):
                     "#": index,
                     "block_id": block_id,
                     "time": format_timestamp(block.get("start", 0)),
+                    "segment_id": boundary.get("refined_segment_id"),
+                    "segment_time": format_timestamp(boundary.get("refined_time", block.get("start", 0)) or 0),
                     "confidence": round(float(boundary.get("confidence", 0) or 0), 3),
                     "sources": format_boundary_sources(boundary),
                     "reason": boundary.get("reason", ""),
+                    "segment_text": str(boundary.get("refined_text", ""))[:140],
                     "block_text": str(block.get("text", ""))[:160],
                 })
 
@@ -1266,16 +1483,25 @@ def render_chapter_debug_panel(project_dir: Path):
             st.warning("Выбранных границ нет. Проверь raw-ответы и кандидаты ниже.")
 
         if ranges:
-            range_rows = [
-                {
-                    "#": index,
-                    "start_block": item.get("start_block_id"),
-                    "end_block": item.get("end_block_id"),
-                    "start_time": format_timestamp(blocks_by_id.get(int(item.get("start_block_id", 0)), {}).get("start", 0)),
-                    "end_time": format_timestamp(blocks_by_id.get(int(item.get("end_block_id", 0)), {}).get("end", 0)),
-                }
-                for index, item in enumerate(ranges, start=1)
-            ]
+            range_rows = []
+            for index, item in enumerate(ranges, start=1):
+                if "start_id" in item:
+                    range_rows.append({
+                        "#": index,
+                        "start_segment": item.get("start_id"),
+                        "end_segment": item.get("end_id"),
+                        "start_time": format_timestamp(item.get("start", 0) or 0),
+                        "end_time": format_timestamp(item.get("end", 0) or 0),
+                    })
+                else:
+                    range_rows.append({
+                        "#": index,
+                        "start_block": item.get("start_block_id"),
+                        "end_block": item.get("end_block_id"),
+                        "start_time": format_timestamp(blocks_by_id.get(int(item.get("start_block_id", 0)), {}).get("start", 0)),
+                        "end_time": format_timestamp(blocks_by_id.get(int(item.get("end_block_id", 0)), {}).get("end", 0)),
+                    })
+
             st.write("Собранные диапазоны глав")
             st.dataframe(range_rows, use_container_width=True, hide_index=True)
 
@@ -1465,6 +1691,26 @@ def render_timestamp_evaluation():
 
         reference = sources[option_labels.index(reference_label)]["intervals"]
         prediction = sources[option_labels.index(prediction_label)]["intervals"]
+
+        timeline_duration = max(
+            [
+                float(st.session_state.get("media_duration") or 0),
+                float(fallback_duration or 0),
+            ] + [
+                float(item.get("end", 0) or 0)
+                for item in reference + prediction
+            ]
+        )
+
+        components.html(
+            build_eval_comparison_timeline_html(
+                reference=reference,
+                prediction=prediction,
+                duration=timeline_duration,
+                iou_threshold=iou_threshold,
+            ),
+            height=230,
+        )
 
         quick_rows = []
         for quick_iou in (0.30, 0.50, 0.70):
