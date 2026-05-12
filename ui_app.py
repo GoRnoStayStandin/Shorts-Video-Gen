@@ -31,8 +31,11 @@ from benchmark_tools import (
     CHAPTERING_VERSION,
     GPT4ALL_DEVICE,
     GPT4ALL_FAST_TOPIC_MAX_TOKENS,
+    GPT4ALL_GPU_BACKENDS,
+    GPT4ALL_MIN_FREE_VRAM_MB,
     GPT4ALL_TOPIC_MAX_TOKENS,
     LAST_CHAPTERING_DEBUG,
+    LAST_GPT4ALL_RUNTIME,
     TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW,
     TOPIC_FAST_OVERLAP_SEGMENTS,
     TOPIC_MAX_SEGMENTS_PER_WINDOW,
@@ -737,6 +740,13 @@ def process_video_pipeline(video_path: Path, project_dir: Path):
         status_box.error(f"Не удалось загрузить GPT4All: {e}")
         progress_bar.progress(1.0)
         return
+
+    if LAST_GPT4ALL_RUNTIME:
+        status_box.info(
+            "GPT4All загружен: "
+            f"backend `{LAST_GPT4ALL_RUNTIME.get('backend', 'unknown')}`, "
+            f"device `{LAST_GPT4ALL_RUNTIME.get('device') or LAST_GPT4ALL_RUNTIME.get('attempted_device', 'cpu')}`."
+        )
 
     def topic_progress(done, total, message):
         local_progress = done / total if total else 1.0
@@ -1819,14 +1829,28 @@ with st.expander("Настройки ускорения", expanded=False):
         st.caption(f"GPU: {gpu_error}. ASR будет использовать CPU fallback.")
 
     st.write(
-        f"**GPT4All:** устройство `{GPT4ALL_DEVICE}` · "
-        f"окно сегментации `{TOPIC_MAX_SEGMENTS_PER_WINDOW}` сегм., overlap `{TOPIC_OVERLAP_SEGMENTS}`"
+        f"**GPT4All:** запрос устройства `{GPT4ALL_DEVICE}` · "
+        f"GPU backends `{', '.join(GPT4ALL_GPU_BACKENDS)}` · "
+        f"min free VRAM `{GPT4ALL_MIN_FREE_VRAM_MB}` MB"
+    )
+
+    if LAST_GPT4ALL_RUNTIME:
+        st.caption(
+            "Последняя загрузка GPT4All: "
+            f"attempt `{LAST_GPT4ALL_RUNTIME.get('attempted_device', 'default')}`, "
+            f"backend `{LAST_GPT4ALL_RUNTIME.get('backend', 'unknown')}`, "
+            f"device `{LAST_GPT4ALL_RUNTIME.get('device') or 'cpu/none'}`."
+        )
+
+    st.caption(
+        f"ИИ-сегментация: окно `{TOPIC_MAX_SEGMENTS_PER_WINDOW}` сегм., overlap `{TOPIC_OVERLAP_SEGMENTS}`. "
+        "Если GPU не подходит или backend не загрузился, GPT4All автоматически откатится на CPU."
     )
     st.write(f"**Экспорт:** NVENC {'включён' if USE_NVENC_FOR_EXPORT else 'выключен'} с fallback на libx264")
     st.caption(
         "Эти значения можно менять через переменные окружения без правки кода: "
         "ASR_DEVICE, ASR_AUTO_TUNE, ASR_ALLOW_MODEL_DOWNGRADE, FASTER_WHISPER_MODEL, "
-        "FW_GPU_BATCH_SIZE, GPT4ALL_DEVICE, USE_NVENC_FOR_EXPORT."
+        "FW_GPU_BATCH_SIZE, GPT4ALL_DEVICE, GPT4ALL_GPU_BACKENDS, GPT4ALL_MIN_FREE_VRAM_MB, USE_NVENC_FOR_EXPORT."
     )
 
 available_model_paths = [str(path) for path in get_available_gpt4all_models()]

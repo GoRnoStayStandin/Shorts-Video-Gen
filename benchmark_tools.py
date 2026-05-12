@@ -59,6 +59,15 @@ def get_env_int(name: str, default: int) -> int:
         return default
 
 
+def get_env_list(name: str, default: str) -> List[str]:
+    value = os.getenv(name, default)
+    return [
+        item.strip().lower()
+        for item in re.split(r"[,;\s]+", str(value or ""))
+        if item.strip()
+    ]
+
+
 VIDEO_PATH = os.getenv("VIDEO_PATH", "data/sample.mp4")
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
@@ -122,8 +131,10 @@ ASR_ALLOW_MODEL_DOWNGRADE = get_env_bool("ASR_ALLOW_MODEL_DOWNGRADE", True)
 ASR_GPU_LOW_VRAM_MB = get_env_int("ASR_GPU_LOW_VRAM_MB", 6144)
 ASR_GPU_MIN_FREE_VRAM_MB = get_env_int("ASR_GPU_MIN_FREE_VRAM_MB", 1024)
 
-# GPT4All на Windows часто стабильнее на CPU. При желании можно поставить cuda/nvidia/kompute.
-GPT4ALL_DEVICE = os.getenv("GPT4ALL_DEVICE", "cpu").strip().lower()
+# GPT4All: auto пробует GPU, если он выглядит подходящим, и безопасно откатывается на CPU.
+GPT4ALL_DEVICE = os.getenv("GPT4ALL_DEVICE", "auto").strip().lower()
+GPT4ALL_GPU_BACKENDS = get_env_list("GPT4ALL_GPU_BACKENDS", "nvidia,kompute,cuda")
+GPT4ALL_MIN_FREE_VRAM_MB = get_env_int("GPT4ALL_MIN_FREE_VRAM_MB", 6144)
 GPT4ALL_THREADS = get_env_int("GPT4ALL_THREADS", 0)
 GPT4ALL_TOPIC_MAX_TOKENS = get_env_int("GPT4ALL_TOPIC_MAX_TOKENS", 220)
 GPT4ALL_FAST_TOPIC_MAX_TOKENS = get_env_int("GPT4ALL_FAST_TOPIC_MAX_TOKENS", 90)
@@ -158,6 +169,7 @@ USE_NVENC_FOR_EXPORT = get_env_bool("USE_NVENC_FOR_EXPORT", True)
 EXPORT_MODE = os.getenv("EXPORT_MODE", "reencode").strip().lower()
 
 LAST_ASR_RUNTIME: Dict = {}
+LAST_GPT4ALL_RUNTIME: Dict = {}
 LAST_CHAPTERING_DEBUG: Dict = {}
 
 SUPPORTED_VIDEO_HOSTS = {
@@ -1033,6 +1045,160 @@ def transcribe_with_faster_whisper(
 # GPT4ALL
 # =========================
 
+def add_gpt4all_attempt_once(attempts: List[Dict], kwargs: Dict, device_label: str, reason: str):
+    key = (
+        kwargs.get("device", "default"),
+        kwargs.get("n_ctx"),
+        kwargs.get("n_threads"),
+        kwargs.get("allow_download"),
+    )
+
+    for attempt in attempts:
+        attempt_kwargs = attempt["kwargs"]
+        existing_key = (
+            attempt_kwargs.get("device", "default"),
+            attempt_kwargs.get("n_ctx"),
+            attempt_kwargs.get("n_threads"),
+            attempt_kwargs.get("allow_download"),
+        )
+        if existing_key == key:
+            return
+
+    attempts.append({
+        "kwargs": kwargs,
+        "device": device_label,
+        "reason": reason,
+    })
+
+
+def get_gpt4all_gpu_names() -> List[str]:
+    if GPT4All is None or not hasattr(GPT4All, "list_gpus"):
+        return []
+
+    try:
+        return [str(name) for name in (GPT4All.list_gpus() or []) if str(name).strip()]
+    except Exception as e:
+        print(f"[WARN] GPT4All GPU listing failed: {e}")
+        return []
+
+
+def gpt4all_has_enough_vram(hardware: Dict) -> bool:
+    if GPT4ALL_MIN_FREE_VRAM_MB <= 0:
+        return True
+
+    total_vram = float(hardware.get("gpu_memory_total_mb") or 0)
+    free_vram = float(hardware.get("gpu_memory_free_mb") or 0)
+    usable_vram = free_vram if free_vram > 0 else total_vram
+
+    if total_vram > 0 and total_vram < GPT4ALL_MIN_FREE_VRAM_MB:
+        return False
+
+    if usable_vram <= 0:
+        return True
+
+    return usable_vram >= GPT4ALL_MIN_FREE_VRAM_MB
+
+
+def build_gpt4all_load_attempts(base_kwargs: Dict) -> List[Dict]:
+    requested_device = (GPT4ALL_DEVICE or "auto").strip().lower()
+    attempts: List[Dict] = []
+
+    def add_device_attempt(device: str, reason: str):
+        kwargs = dict(base_kwargs)
+        kwargs["device"] = device
+        add_gpt4all_attempt_once(attempts, kwargs, device, reason)
+
+    if requested_device in {"cpu", "none", "off"}:
+        add_device_attempt("cpu", "requested_cpu")
+    elif requested_device in {"auto", ""}:
+        hardware = detect_hardware_profile()
+        gpu_backends = [
+            backend
+            for backend in GPT4ALL_GPU_BACKENDS
+            if backend not in {"auto", "cpu", "none", "off"}
+        ]
+
+        if hardware.get("gpu_available"):
+            if gpt4all_has_enough_vram(hardware):
+                gpu_name = hardware.get("gpu_name") or "NVIDIA GPU"
+                for backend in gpu_backends:
+                    add_device_attempt(backend, f"auto_nvidia_gpu:{gpu_name}")
+            else:
+                print(
+                    "[INFO] Skipping GPT4All GPU auto-attempt: "
+                    f"free/total VRAM {hardware.get('gpu_memory_free_mb')}/{hardware.get('gpu_memory_total_mb')} MB "
+                    f"is below GPT4ALL_MIN_FREE_VRAM_MB={GPT4ALL_MIN_FREE_VRAM_MB}."
+                )
+        else:
+            gpu_names = get_gpt4all_gpu_names()
+            if gpu_names:
+                names_lower = " ".join(gpu_names).lower()
+                for backend in gpu_backends:
+                    if backend in {"cuda", "nvidia"} and "nvidia" not in names_lower:
+                        continue
+                    add_device_attempt(backend, "auto_gpt4all_list_gpus")
+
+        add_device_attempt("cpu", "cpu_fallback")
+    else:
+        add_device_attempt(requested_device, "requested_device")
+        if requested_device != "cpu":
+            add_device_attempt("cpu", "cpu_fallback")
+
+    legacy_base_kwargs = {
+        "model_name": base_kwargs["model_name"],
+        "allow_download": base_kwargs.get("allow_download", False),
+    }
+    add_gpt4all_attempt_once(
+        attempts,
+        {**legacy_base_kwargs, "device": "cpu"},
+        "cpu",
+        "legacy_cpu_without_n_ctx"
+    )
+    add_gpt4all_attempt_once(
+        attempts,
+        dict(legacy_base_kwargs),
+        "default",
+        "legacy_default_without_n_ctx"
+    )
+
+    return attempts
+
+
+def read_gpt4all_runtime(model) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        backend = getattr(model, "backend", None)
+    except Exception:
+        backend = None
+
+    try:
+        device = getattr(model, "device", None)
+    except Exception:
+        device = None
+
+    return backend, device
+
+
+def remember_gpt4all_runtime(model, selected_model_path: str, n_ctx: int, attempt: Dict):
+    backend, actual_device = read_gpt4all_runtime(model)
+    kwargs = attempt.get("kwargs", {})
+
+    LAST_GPT4ALL_RUNTIME.clear()
+    LAST_GPT4ALL_RUNTIME.update({
+        "requested_device": GPT4ALL_DEVICE,
+        "attempted_device": kwargs.get("device", "default"),
+        "attempt_reason": attempt.get("reason"),
+        "backend": backend or "unknown",
+        "device": actual_device,
+        "model_path": selected_model_path,
+        "n_ctx": kwargs.get("n_ctx", n_ctx),
+    })
+
+    print(
+        "[INFO] GPT4All loaded: "
+        f"requested={GPT4ALL_DEVICE} attempted={kwargs.get('device', 'default')} "
+        f"backend={backend or 'unknown'} device={actual_device or 'cpu/none'}"
+    )
+
 def load_gpt4all_model(n_ctx: int = 4096, model_path: Optional[str] = None):
     """
     Загружает GPT4All.
@@ -1056,25 +1222,21 @@ def load_gpt4all_model(n_ctx: int = 4096, model_path: Optional[str] = None):
     if GPT4ALL_THREADS > 0:
         base_kwargs["n_threads"] = GPT4ALL_THREADS
 
-    attempts = []
-
-    if GPT4ALL_DEVICE and GPT4ALL_DEVICE not in {"auto", "none"}:
-        attempts.append({**base_kwargs, "device": GPT4ALL_DEVICE})
-
-    # CPU fallback — самый стабильный вариант на Windows.
-    attempts.append({**base_kwargs, "device": "cpu"})
-    attempts.append({"model_name": selected_model_path, "allow_download": False, "device": "cpu"})
-    attempts.append({"model_name": selected_model_path, "allow_download": False})
+    attempts = build_gpt4all_load_attempts(base_kwargs)
 
     last_error = None
 
-    for kwargs in attempts:
+    for attempt in attempts:
+        kwargs = attempt["kwargs"]
         try:
             print(
                 f"[INFO] Loading GPT4All model={selected_model_path} "
-                f"device={kwargs.get('device', 'default')} n_ctx={kwargs.get('n_ctx', 'default')}"
+                f"device={kwargs.get('device', 'default')} n_ctx={kwargs.get('n_ctx', 'default')} "
+                f"reason={attempt.get('reason', 'unknown')}"
             )
-            return GPT4All(**kwargs)
+            model = GPT4All(**kwargs)
+            remember_gpt4all_runtime(model, selected_model_path, n_ctx, attempt)
+            return model
         except TypeError as e:
             last_error = e
             continue
@@ -1082,6 +1244,13 @@ def load_gpt4all_model(n_ctx: int = 4096, model_path: Optional[str] = None):
             last_error = e
             print(f"[WARN] GPT4All load failed with {kwargs.get('device', 'default')}: {e}")
             continue
+
+    LAST_GPT4ALL_RUNTIME.clear()
+    LAST_GPT4ALL_RUNTIME.update({
+        "requested_device": GPT4ALL_DEVICE,
+        "model_path": selected_model_path,
+        "error": str(last_error),
+    })
 
     raise RuntimeError(f"Не удалось загрузить GPT4All: {last_error}")
 
@@ -1100,43 +1269,47 @@ def extract_json_from_model_answer(answer: str):
     except Exception:
         pass
 
-    start = text.find("{")
-    if start == -1:
-        return None
+    json_starts = [
+        (start, opening, closing)
+        for opening, closing in (("{", "}"), ("[", "]"))
+        for start in [text.find(opening)]
+        if start != -1
+    ]
 
-    depth = 0
-    in_string = False
-    escape = False
+    for start, opening, closing in sorted(json_starts, key=lambda item: item[0]):
+        depth = 0
+        in_string = False
+        escape = False
 
-    for i in range(start, len(text)):
-        ch = text[i]
+        for i in range(start, len(text)):
+            ch = text[i]
 
-        if escape:
-            escape = False
-            continue
+            if escape:
+                escape = False
+                continue
 
-        if ch == "\\":
-            escape = True
-            continue
+            if ch == "\\":
+                escape = True
+                continue
 
-        if ch == '"':
-            in_string = not in_string
-            continue
+            if ch == '"':
+                in_string = not in_string
+                continue
 
-        if in_string:
-            continue
+            if in_string:
+                continue
 
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
+            if ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
 
-            if depth == 0:
-                candidate = text[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except Exception:
-                    return None
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        break
 
     return None
 
@@ -2429,7 +2602,12 @@ def ask_gpt4all_for_topics_in_window(
         print(answer[:500])
         return []
 
-    topics = parsed.get("topics", [])
+    if isinstance(parsed, dict):
+        topics = parsed.get("topics", [])
+    elif isinstance(parsed, list):
+        topics = parsed
+    else:
+        return []
 
     if not isinstance(topics, list):
         return []
@@ -2441,6 +2619,9 @@ def ask_gpt4all_for_topics_in_window(
     max_id = max(allowed_ids)
 
     for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+
         try:
             start_id = int(topic.get("start_id"))
             end_id = int(topic.get("end_id"))
