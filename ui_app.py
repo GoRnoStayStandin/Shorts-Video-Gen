@@ -34,6 +34,7 @@ from benchmark_tools import (
     GPT4ALL_GPU_BACKENDS,
     GPT4ALL_MIN_FREE_VRAM_MB,
     GPT4ALL_TOPIC_MAX_TOKENS,
+    LAST_ASR_RUNTIME,
     LAST_CHAPTERING_DEBUG,
     LAST_GPT4ALL_RUNTIME,
     TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW,
@@ -41,6 +42,7 @@ from benchmark_tools import (
     TOPIC_MAX_SEGMENTS_PER_WINDOW,
     TOPIC_OVERLAP_SEGMENTS,
     USE_NVENC_FOR_EXPORT,
+    ResourceMonitor,
     analyze_topic_with_gpt4all_model,
     build_asr_profile_ladder,
     build_srt_for_clip,
@@ -54,11 +56,13 @@ from benchmark_tools import (
     llm_topic_segmentation,
     load_gpt4all_model,
     make_topic_label,
+    normalize_subtitle_split_mode,
     read_json_if_exists,
     safe_filename,
     save_json,
     score_topic_segment_v2,
     transcribe_with_faster_whisper,
+    write_pipeline_text_report,
 )
 from timestamp_eval import (
     block_to_intervals,
@@ -645,197 +649,373 @@ def build_eval_comparison_timeline_html(reference, prediction, duration, iou_thr
 # =========================
 
 def process_video_pipeline(video_path: Path, project_dir: Path):
+    project_dir.mkdir(exist_ok=True, parents=True)
+    monitor = ResourceMonitor(project_dir / "monitoring", interval_sec=2.0).start()
+    pipeline_started = time.perf_counter()
+    stage_name = None
+    stage_started = None
+    stage_times = {}
+    finalized = False
+    report_context = {
+        "video_path": str(video_path),
+        "project_dir": str(project_dir),
+    }
+
+    def set_stage(name: str):
+        nonlocal stage_name, stage_started
+        now = time.perf_counter()
+        if stage_name is not None and stage_started is not None:
+            stage_times[stage_name] = stage_times.get(stage_name, 0.0) + (now - stage_started)
+        stage_name = name
+        stage_started = now
+        monitor.set_stage(name)
+
+    def finalize_pipeline(status: str, message: str = ""):
+        nonlocal finalized, stage_name, stage_started
+        if finalized:
+            return
+
+        now = time.perf_counter()
+        if stage_name is not None and stage_started is not None:
+            stage_times[stage_name] = stage_times.get(stage_name, 0.0) + (now - stage_started)
+            stage_name = None
+            stage_started = None
+
+        resource_summary = monitor.stop()
+        report_path = project_dir / "pipeline_run_report.json"
+        text_report_path = project_dir / "pipeline_run_report.txt"
+        report = {
+            "status": status,
+            "message": message,
+            "started_at": resource_summary.get("started_at"),
+            "ended_at": resource_summary.get("ended_at"),
+            "elapsed_sec": round(time.perf_counter() - pipeline_started, 3),
+            "stage_times_sec": {key: round(value, 3) for key, value in stage_times.items()},
+            "context": report_context,
+            "asr_runtime": dict(LAST_ASR_RUNTIME),
+            "gpt4all_runtime": dict(LAST_GPT4ALL_RUNTIME),
+            "resource_summary": resource_summary,
+            "report_json_path": str(report_path),
+            "report_txt_path": str(text_report_path),
+        }
+        save_json(report_path, report)
+        write_pipeline_text_report(text_report_path, report)
+        st.session_state.pipeline_run_report = report
+        st.session_state.pipeline_run_report_path = str(report_path)
+        st.session_state.pipeline_run_text_report_path = str(text_report_path)
+        finalized = True
+
     progress_bar = st.progress(0)
     status_box = st.empty()
 
-    status_box.info("Получаю длительность видео...")
-    media_duration = get_video_duration_sec(str(video_path))
-    st.session_state.media_duration = media_duration
-    progress_bar.progress(0.04)
-
-    asr_dir = project_dir / "asr" / "faster_whisper"
-
-    def asr_progress(progress_value, message):
-        progress_bar.progress(min(max(progress_value, 0.0), 0.65))
-        status_box.info(message)
-
-    fw_segments = transcribe_with_faster_whisper(
-        video_path=str(video_path),
-        out_dir=asr_dir,
-        progress_callback=asr_progress
-    )
-
-    st.session_state.fw_segments = fw_segments
-
-    if not fw_segments:
-        st.session_state.topic_segments = []
-        status_box.error("Речь не распознана или ASR-сегменты пустые.")
-        progress_bar.progress(1.0)
-        return
-
-    topic_dir = project_dir / "topic_segmentation"
-    topic_dir.mkdir(exist_ok=True, parents=True)
-
-    segmentation_goal = st.session_state.get("segmentation_goal", "chapters")
-    is_chapter_goal = segmentation_goal == "chapters"
-    goal_label = "главы видео" if is_chapter_goal else "подтемы/Shorts"
-
-    topic_mode = st.session_state.get("topic_mode", "fast")
-    is_fast_topic_mode = topic_mode == "fast"
-    chapter_sensitivity = str(st.session_state.get("chapter_sensitivity", CHAPTER_BOUNDARY_SENSITIVITY))
-
-    if is_fast_topic_mode:
-        topic_mode_label = "быстрый"
-        topic_max_segments = TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW
-        topic_overlap = TOPIC_FAST_OVERLAP_SEGMENTS
-    else:
-        topic_mode_label = "качественный"
-        topic_max_segments = TOPIC_MAX_SEGMENTS_PER_WINDOW
-        topic_overlap = TOPIC_OVERLAP_SEGMENTS
-
-    generate_metadata = bool(st.session_state.get("generate_topic_metadata", False))
-    effective_generate_metadata = False if is_chapter_goal else generate_metadata
-    metadata_label = "metadata" if effective_generate_metadata else "bounds"
-    if is_chapter_goal:
-        topic_max_tokens = CHAPTER_BOUNDARY_MAX_TOKENS
-    else:
-        topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if effective_generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
-
-    selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
-    selected_model_name = Path(selected_model_path).stem
-    model_cache_key = ui_safe_filename(selected_model_name, max_len=70)
-    segmentation_cache_version = CHAPTERING_VERSION if is_chapter_goal else "topics_v1"
-    sensitivity_cache_part = f"_{chapter_sensitivity}" if is_chapter_goal else ""
-    topic_cache_path = topic_dir / f"topic_segments_{segmentation_goal}_{segmentation_cache_version}{sensitivity_cache_part}_{topic_mode}_{metadata_label}_{model_cache_key}.json"
-
-    cached_topics = read_json_if_exists(str(topic_cache_path))
-
-    if isinstance(cached_topics, list) and cached_topics:
-        save_json(topic_dir / "topic_segments.json", cached_topics)
-        st.session_state.topic_segments = cached_topics
-        st.session_state.selected_position = 0
-        progress_bar.progress(1.0)
-        status_box.success(f"Использую кэш ИИ-сегментации ({goal_label}, {topic_mode_label} режим, {selected_model_name}).")
-        return
-
-    status_box.info(f"Выделяю {goal_label} через GPT4All ({topic_mode_label} режим, {metadata_label}, {selected_model_name})...")
-    progress_bar.progress(0.68)
-
-    if GPT4All is None:
-        st.session_state.topic_segments = []
-        status_box.error(f"gpt4all не установлен. Невозможно выполнить ИИ-сегментацию: {goal_label}.")
-        progress_bar.progress(1.0)
-        return
-
-    if not Path(selected_model_path).exists():
-        st.session_state.topic_segments = []
-        status_box.error(f"Модель GPT4All не найдена: {selected_model_path}")
-        progress_bar.progress(1.0)
-        return
-
     try:
-        model = load_gpt4all_model(n_ctx=4096, model_path=selected_model_path)
-    except Exception as e:
-        st.session_state.topic_segments = []
-        status_box.error(f"Не удалось загрузить GPT4All: {e}")
-        progress_bar.progress(1.0)
-        return
+        set_stage("duration_probe")
+        status_box.info("Получаю длительность видео...")
+        media_duration = get_video_duration_sec(str(video_path))
+        st.session_state.media_duration = media_duration
+        report_context["media_duration_sec"] = media_duration
+        progress_bar.progress(0.04)
 
-    if LAST_GPT4ALL_RUNTIME:
-        status_box.info(
-            "GPT4All загружен: "
-            f"backend `{LAST_GPT4ALL_RUNTIME.get('backend', 'unknown')}`, "
-            f"device `{LAST_GPT4ALL_RUNTIME.get('device') or LAST_GPT4ALL_RUNTIME.get('attempted_device', 'cpu')}`."
+        asr_dir = project_dir / "asr" / "faster_whisper"
+
+        def asr_progress(progress_value, message):
+            progress_bar.progress(min(max(progress_value, 0.0), 0.65))
+            status_box.info(message)
+
+        set_stage("asr")
+        fw_segments = transcribe_with_faster_whisper(
+            video_path=str(video_path),
+            out_dir=asr_dir,
+            progress_callback=asr_progress
         )
+        report_context["asr_segment_count"] = len(fw_segments or [])
 
-    def topic_progress(done, total, message):
-        local_progress = done / total if total else 1.0
-        progress_bar.progress(0.68 + min(local_progress, 1.0) * 0.29)
-        status_box.info(message)
+        st.session_state.fw_segments = fw_segments
 
-    try:
-        if is_chapter_goal:
-            enriched = llm_chapter_segmentation(
-                whisper_segments=fw_segments,
-                model=model,
-                target_block_duration_sec=CHAPTER_BLOCK_TARGET_SEC,
-                max_block_text_chars=CHAPTER_BLOCK_MAX_CHARS,
-                max_blocks_per_window=CHAPTER_MAX_BLOCKS_PER_WINDOW,
-                overlap_blocks=CHAPTER_OVERLAP_BLOCKS,
-                min_chapter_duration_sec=20.0,
-                generate_metadata=False,
-                max_tokens=topic_max_tokens,
-                sensitivity=chapter_sensitivity,
-                progress_callback=topic_progress
-            )
+        if not fw_segments:
+            st.session_state.topic_segments = []
+            message = "Речь не распознана или ASR-сегменты пустые."
+            status_box.error(message)
+            progress_bar.progress(1.0)
+            finalize_pipeline("failed", message)
+            return
+
+        set_stage("segmentation_setup")
+        topic_dir = project_dir / "topic_segmentation"
+        topic_dir.mkdir(exist_ok=True, parents=True)
+
+        segmentation_goal = st.session_state.get("segmentation_goal", "chapters")
+        is_chapter_goal = segmentation_goal == "chapters"
+        goal_label = "главы видео" if is_chapter_goal else "подтемы/Shorts"
+
+        topic_mode = st.session_state.get("topic_mode", "fast")
+        is_fast_topic_mode = topic_mode == "fast"
+        chapter_sensitivity = str(st.session_state.get("chapter_sensitivity", CHAPTER_BOUNDARY_SENSITIVITY))
+
+        if is_fast_topic_mode:
+            topic_mode_label = "быстрый"
+            topic_max_segments = TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW
+            topic_overlap = TOPIC_FAST_OVERLAP_SEGMENTS
         else:
-            enriched = llm_topic_segmentation(
-                whisper_segments=fw_segments,
-                model=model,
-                max_segments_per_window=topic_max_segments,
-                overlap_segments=topic_overlap,
-                min_topic_duration_sec=8.0,
-                max_topic_duration_sec=240.0,
-                fast_mode=is_fast_topic_mode,
-                generate_metadata=effective_generate_metadata,
-                topic_max_tokens=topic_max_tokens,
-                progress_callback=topic_progress
-            )
+            topic_mode_label = "качественный"
+            topic_max_segments = TOPIC_MAX_SEGMENTS_PER_WINDOW
+            topic_overlap = TOPIC_OVERLAP_SEGMENTS
 
-    except Exception as e:
-        st.session_state.topic_segments = []
-        status_box.error(f"Ошибка ИИ-сегментации ({goal_label}): {e}")
-        progress_bar.progress(1.0)
-        return
+        generate_metadata = bool(st.session_state.get("generate_topic_metadata", False))
+        effective_generate_metadata = False if is_chapter_goal else generate_metadata
+        metadata_label = "metadata" if effective_generate_metadata else "bounds"
+        if is_chapter_goal:
+            topic_max_tokens = CHAPTER_BOUNDARY_MAX_TOKENS
+        else:
+            topic_max_tokens = GPT4ALL_TOPIC_MAX_TOKENS if effective_generate_metadata else GPT4ALL_FAST_TOPIC_MAX_TOKENS
 
-    if not enriched:
-        st.session_state.topic_segments = []
-        status_box.warning(
-            f"ИИ не нашёл подходящие {goal_label}. "
-            "Обычно это значит, что GPT4All не смог корректно вернуть JSON или контекст модели всё ещё маловат."
-        )
-        progress_bar.progress(1.0)
-        return
-
-    save_json(topic_cache_path, enriched)
-    save_json(topic_dir / "topic_segments.json", enriched)
-    save_json(
-        topic_dir / "topic_segmentation_settings.json",
-        {
+        selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
+        selected_model_name = Path(selected_model_path).stem
+        model_cache_key = ui_safe_filename(selected_model_name, max_len=70)
+        segmentation_cache_version = CHAPTERING_VERSION if is_chapter_goal else "topics_v1"
+        sensitivity_cache_part = f"_{chapter_sensitivity}" if is_chapter_goal else ""
+        topic_cache_path = topic_dir / f"topic_segments_{segmentation_goal}_{segmentation_cache_version}{sensitivity_cache_part}_{topic_mode}_{metadata_label}_{model_cache_key}.json"
+        report_context.update({
             "segmentation_goal": segmentation_goal,
-            "segmentation_cache_version": segmentation_cache_version,
-            "chaptering_version": CHAPTERING_VERSION if is_chapter_goal else None,
-            "goal_label": goal_label,
-            "mode": topic_mode,
-            "mode_label": topic_mode_label,
-            "max_segments_per_window": topic_max_segments,
-            "overlap_segments": topic_overlap,
-            "chapter_block_target_sec": CHAPTER_BLOCK_TARGET_SEC if is_chapter_goal else None,
-            "chapter_block_max_chars": CHAPTER_BLOCK_MAX_CHARS if is_chapter_goal else None,
-            "chapter_max_blocks_per_window": CHAPTER_MAX_BLOCKS_PER_WINDOW if is_chapter_goal else None,
-            "chapter_overlap_blocks": CHAPTER_OVERLAP_BLOCKS if is_chapter_goal else None,
-            "chapter_boundary_window_blocks": CHAPTER_BOUNDARY_WINDOW_BLOCKS if is_chapter_goal else None,
-            "chapter_boundary_overlap_blocks": CHAPTER_BOUNDARY_OVERLAP_BLOCKS if is_chapter_goal else None,
-            "chapter_boundary_sensitivity": chapter_sensitivity if is_chapter_goal else None,
-            "chapter_full_transcript_max_chars": CHAPTER_FULL_TRANSCRIPT_MAX_CHARS if is_chapter_goal else None,
-            "chapter_summary_window_blocks": CHAPTER_SUMMARY_WINDOW_BLOCKS if is_chapter_goal else None,
-            "max_tokens": topic_max_tokens,
-            "fast_mode": is_fast_topic_mode,
+            "segmentation_goal_label": goal_label,
+            "topic_mode": topic_mode,
+            "topic_mode_label": topic_mode_label,
+            "chapter_sensitivity": chapter_sensitivity if is_chapter_goal else None,
             "generate_metadata_requested": generate_metadata,
             "generate_metadata_effective": effective_generate_metadata,
             "model_path": selected_model_path,
             "model_name": selected_model_name,
-        }
-    )
+            "topic_cache_path": str(topic_cache_path),
+        })
 
-    if is_chapter_goal and LAST_CHAPTERING_DEBUG:
-        save_json(topic_dir / "debug_chaptering_v3.json", LAST_CHAPTERING_DEBUG)
+        cached_topics = read_json_if_exists(str(topic_cache_path))
 
-    st.session_state.topic_segments = enriched
-    st.session_state.selected_position = 0
+        if isinstance(cached_topics, list) and cached_topics:
+            save_json(topic_dir / "topic_segments.json", cached_topics)
+            st.session_state.topic_segments = cached_topics
+            st.session_state.selected_position = 0
+            report_context["topic_segment_count"] = len(cached_topics)
+            progress_bar.progress(1.0)
+            message = f"Использую кэш ИИ-сегментации ({goal_label}, {topic_mode_label} режим, {selected_model_name})."
+            status_box.success(message)
+            finalize_pipeline("cached", message)
+            return
 
-    progress_bar.progress(1.0)
-    status_box.success("Обработка завершена.")
+        status_box.info(f"Выделяю {goal_label} через GPT4All ({topic_mode_label} режим, {metadata_label}, {selected_model_name})...")
+        progress_bar.progress(0.68)
+
+        if GPT4All is None:
+            st.session_state.topic_segments = []
+            message = f"gpt4all не установлен. Невозможно выполнить ИИ-сегментацию: {goal_label}."
+            status_box.error(message)
+            progress_bar.progress(1.0)
+            finalize_pipeline("failed", message)
+            return
+
+        if not Path(selected_model_path).exists():
+            st.session_state.topic_segments = []
+            message = f"Модель GPT4All не найдена: {selected_model_path}"
+            status_box.error(message)
+            progress_bar.progress(1.0)
+            finalize_pipeline("failed", message)
+            return
+
+        set_stage("model_load")
+        try:
+            model = load_gpt4all_model(n_ctx=4096, model_path=selected_model_path)
+        except Exception as e:
+            st.session_state.topic_segments = []
+            message = f"Не удалось загрузить GPT4All: {e}"
+            status_box.error(message)
+            progress_bar.progress(1.0)
+            finalize_pipeline("failed", message)
+            return
+
+        if LAST_GPT4ALL_RUNTIME:
+            status_box.info(
+                "GPT4All загружен: "
+                f"backend `{LAST_GPT4ALL_RUNTIME.get('backend', 'unknown')}`, "
+                f"device `{LAST_GPT4ALL_RUNTIME.get('device') or LAST_GPT4ALL_RUNTIME.get('attempted_device', 'cpu')}`."
+            )
+
+        def topic_progress(done, total, message):
+            local_progress = done / total if total else 1.0
+            progress_bar.progress(0.68 + min(local_progress, 1.0) * 0.29)
+            status_box.info(message)
+
+        set_stage("llm_processing")
+        try:
+            if is_chapter_goal:
+                enriched = llm_chapter_segmentation(
+                    whisper_segments=fw_segments,
+                    model=model,
+                    target_block_duration_sec=CHAPTER_BLOCK_TARGET_SEC,
+                    max_block_text_chars=CHAPTER_BLOCK_MAX_CHARS,
+                    max_blocks_per_window=CHAPTER_MAX_BLOCKS_PER_WINDOW,
+                    overlap_blocks=CHAPTER_OVERLAP_BLOCKS,
+                    min_chapter_duration_sec=20.0,
+                    generate_metadata=False,
+                    max_tokens=topic_max_tokens,
+                    sensitivity=chapter_sensitivity,
+                    progress_callback=topic_progress
+                )
+            else:
+                enriched = llm_topic_segmentation(
+                    whisper_segments=fw_segments,
+                    model=model,
+                    max_segments_per_window=topic_max_segments,
+                    overlap_segments=topic_overlap,
+                    min_topic_duration_sec=8.0,
+                    max_topic_duration_sec=240.0,
+                    fast_mode=is_fast_topic_mode,
+                    generate_metadata=effective_generate_metadata,
+                    topic_max_tokens=topic_max_tokens,
+                    progress_callback=topic_progress
+                )
+
+        except Exception as e:
+            st.session_state.topic_segments = []
+            message = f"Ошибка ИИ-сегментации ({goal_label}): {e}"
+            status_box.error(message)
+            progress_bar.progress(1.0)
+            finalize_pipeline("failed", message)
+            return
+
+        report_context["topic_segment_count"] = len(enriched or [])
+
+        if not enriched:
+            st.session_state.topic_segments = []
+            message = (
+                f"ИИ не нашёл подходящие {goal_label}. "
+                "Обычно это значит, что GPT4All не смог корректно вернуть JSON или контекст модели всё ещё маловат."
+            )
+            status_box.warning(message)
+            progress_bar.progress(1.0)
+            finalize_pipeline("failed", message)
+            return
+
+        set_stage("save_results")
+        save_json(topic_cache_path, enriched)
+        save_json(topic_dir / "topic_segments.json", enriched)
+        save_json(
+            topic_dir / "topic_segmentation_settings.json",
+            {
+                "segmentation_goal": segmentation_goal,
+                "segmentation_cache_version": segmentation_cache_version,
+                "chaptering_version": CHAPTERING_VERSION if is_chapter_goal else None,
+                "goal_label": goal_label,
+                "mode": topic_mode,
+                "mode_label": topic_mode_label,
+                "max_segments_per_window": topic_max_segments,
+                "overlap_segments": topic_overlap,
+                "chapter_block_target_sec": CHAPTER_BLOCK_TARGET_SEC if is_chapter_goal else None,
+                "chapter_block_max_chars": CHAPTER_BLOCK_MAX_CHARS if is_chapter_goal else None,
+                "chapter_max_blocks_per_window": CHAPTER_MAX_BLOCKS_PER_WINDOW if is_chapter_goal else None,
+                "chapter_overlap_blocks": CHAPTER_OVERLAP_BLOCKS if is_chapter_goal else None,
+                "chapter_boundary_window_blocks": CHAPTER_BOUNDARY_WINDOW_BLOCKS if is_chapter_goal else None,
+                "chapter_boundary_overlap_blocks": CHAPTER_BOUNDARY_OVERLAP_BLOCKS if is_chapter_goal else None,
+                "chapter_boundary_sensitivity": chapter_sensitivity if is_chapter_goal else None,
+                "chapter_full_transcript_max_chars": CHAPTER_FULL_TRANSCRIPT_MAX_CHARS if is_chapter_goal else None,
+                "chapter_summary_window_blocks": CHAPTER_SUMMARY_WINDOW_BLOCKS if is_chapter_goal else None,
+                "max_tokens": topic_max_tokens,
+                "fast_mode": is_fast_topic_mode,
+                "generate_metadata_requested": generate_metadata,
+                "generate_metadata_effective": effective_generate_metadata,
+                "model_path": selected_model_path,
+                "model_name": selected_model_name,
+            }
+        )
+
+        if is_chapter_goal and LAST_CHAPTERING_DEBUG:
+            save_json(topic_dir / "debug_chaptering_v3.json", LAST_CHAPTERING_DEBUG)
+
+        st.session_state.topic_segments = enriched
+        st.session_state.selected_position = 0
+
+        progress_bar.progress(1.0)
+        status_box.success("Обработка завершена.")
+        finalize_pipeline("success", "Обработка завершена.")
+    except Exception as e:
+        finalize_pipeline("error", str(e))
+        raise
+
+
+def render_pipeline_report(project_dir: Path):
+    report_path = project_dir / "pipeline_run_report.json"
+    report = st.session_state.get("pipeline_run_report") or read_json_if_exists(str(report_path))
+
+    if not isinstance(report, dict):
+        return
+
+    resource_summary = report.get("resource_summary") or {}
+    stage_times = report.get("stage_times_sec") or {}
+    text_report_path = Path(report.get("report_txt_path") or (project_dir / "pipeline_run_report.txt"))
+
+    with st.expander("Отчет запуска и ресурсы", expanded=False):
+        st.caption(f"JSON: `{report_path}`")
+        if text_report_path.exists():
+            st.caption(f"TXT: `{text_report_path}`")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Статус", str(report.get("status", "unknown")))
+        m2.metric("Время", f"{float(report.get('elapsed_sec') or 0):.1f} сек")
+        m3.metric("CPU peak", f"{float(resource_summary.get('cpu_percent_peak') or 0):.0f}%")
+        m4.metric("GPU peak", f"{float(resource_summary.get('gpu_util_percent_peak') or 0):.0f}%")
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("RAM peak", f"{float(resource_summary.get('ram_used_mb_peak') or 0):.0f} MB")
+        r2.metric("VRAM peak", f"{float(resource_summary.get('gpu_memory_used_mb_peak') or 0):.0f} MB")
+        r3.metric("Disk read", f"{float(resource_summary.get('disk_read_mb_total') or 0):.0f} MB")
+        r4.metric("Disk write", f"{float(resource_summary.get('disk_write_mb_total') or 0):.0f} MB")
+
+        if report.get("message"):
+            st.write(report["message"])
+
+        if stage_times:
+            st.write("Время по этапам")
+            st.dataframe(
+                [{"stage": key, "seconds": round(float(value), 2)} for key, value in stage_times.items()],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        stages = resource_summary.get("stages") or {}
+        if stages:
+            st.write("Нагрузка по этапам")
+            stage_rows = []
+            for stage, data in stages.items():
+                stage_rows.append({
+                    "stage": stage,
+                    "CPU avg": data.get("cpu_percent_avg"),
+                    "CPU peak": data.get("cpu_percent_peak"),
+                    "GPU avg": data.get("gpu_util_percent_avg"),
+                    "GPU peak": data.get("gpu_util_percent_peak"),
+                    "VRAM peak MB": data.get("gpu_memory_used_mb_peak"),
+                    "RAM peak MB": data.get("ram_used_mb_peak"),
+                })
+            st.dataframe(stage_rows, use_container_width=True, hide_index=True)
+
+        download_col_1, download_col_2 = st.columns(2)
+        if text_report_path.exists():
+            with open(text_report_path, "rb") as f:
+                download_col_1.download_button(
+                    "Скачать TXT отчет",
+                    data=f,
+                    file_name=text_report_path.name,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+        samples_csv = resource_summary.get("samples_csv")
+        if samples_csv and Path(samples_csv).exists():
+            with open(samples_csv, "rb") as f:
+                download_col_2.download_button(
+                    "Скачать CSV ресурсов",
+                    data=f,
+                    file_name=Path(samples_csv).name,
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
 
 # =========================
@@ -895,24 +1075,241 @@ def apply_widget_values_to_segment(position: int):
     return seg
 
 
-def generate_srt_for_clip(seg, fw_segments, project_dir: Path):
-    out_dir = project_dir / "selected_subtitles"
+SUBTITLE_SPLIT_LABELS = {
+    "ASR-сегмент": "segment",
+    "1 слово": "words_1",
+    "2 слова": "words_2",
+    "3 слова": "words_3",
+    "5 слов": "words_5",
+    "Целое предложение": "sentence",
+}
+
+SUBTITLE_POSITION_LABELS = {
+    "Снизу": "bottom",
+    "Выше снизу": "upper_bottom",
+    "По центру": "center",
+}
+
+SUBTITLE_ANIMATION_LABELS = {
+    "Без анимации": "none",
+    "Fade in/out": "fade",
+    "Pop-up": "popup",
+}
+
+SUBTITLE_FONT_OPTIONS = ["Arial", "Segoe UI", "Tahoma", "Verdana"]
+
+
+def subtitle_cache_key(clip_id, subtitle_split_mode: str, namespace: str = "clip") -> str:
+    return f"{namespace}:{clip_id}:{normalize_subtitle_split_mode(subtitle_split_mode)}"
+
+
+def default_subtitle_margin_for_position(position_label: str) -> int:
+    if position_label == "По центру":
+        return 0
+    if position_label == "Выше снизу":
+        return 220
+    return 32
+
+
+def get_export_settings_for_clip(clip_id):
+    aspect_mode = "vertical_9_16" if st.session_state.get(f"aspect_{clip_id}") == "Вертикальный 9:16" else "original"
+    subtitle_mode = st.session_state.get(f"subtitle_mode_{clip_id}", "Отдельный SRT рядом")
+    subtitle_position_label = st.session_state.get(f"subtitle_position_{clip_id}", "Снизу")
+    subtitle_split_label = st.session_state.get(f"subtitle_split_{clip_id}", "3 слова")
+    subtitle_animation_label = st.session_state.get(f"subtitle_animation_{clip_id}", "Без анимации")
+    subtitle_style = {
+        "subtitle_font_name": st.session_state.get(f"subtitle_font_{clip_id}", "Arial"),
+        "subtitle_primary_color": st.session_state.get(f"subtitle_color_{clip_id}", "#FFFFFF"),
+        "subtitle_outline_color": st.session_state.get(f"subtitle_outline_color_{clip_id}", "#000000"),
+        "subtitle_outline_width": int(st.session_state.get(f"subtitle_outline_width_{clip_id}", 2)),
+        "subtitle_shadow": int(st.session_state.get(f"subtitle_shadow_{clip_id}", 1)),
+        "subtitle_margin_v": int(
+            st.session_state.get(
+                f"subtitle_margin_{clip_id}",
+                default_subtitle_margin_for_position(subtitle_position_label),
+            )
+        ),
+        "subtitle_animation": SUBTITLE_ANIMATION_LABELS.get(subtitle_animation_label, "none"),
+    }
+    return (
+        aspect_mode,
+        subtitle_mode,
+        SUBTITLE_POSITION_LABELS.get(subtitle_position_label, "bottom"),
+        int(st.session_state.get(f"subtitle_size_{clip_id}", 28)),
+        SUBTITLE_SPLIT_LABELS.get(subtitle_split_label, "words_3"),
+        subtitle_style,
+    )
+
+
+def render_export_settings_controls(clip_id):
+    aspect_key = f"aspect_{clip_id}"
+    subtitle_mode_key = f"subtitle_mode_{clip_id}"
+    subtitle_position_key = f"subtitle_position_{clip_id}"
+    subtitle_size_key = f"subtitle_size_{clip_id}"
+    subtitle_split_key = f"subtitle_split_{clip_id}"
+
+    st.radio(
+        "Формат видео",
+        options=["Оригинальный", "Вертикальный 9:16"],
+        horizontal=True,
+        key=aspect_key
+    )
+
+    st.radio(
+        "Субтитры при экспорте",
+        options=["Не добавлять", "Отдельный SRT рядом", "Вшить в видео"],
+        horizontal=True,
+        index=1,
+        key=subtitle_mode_key
+    )
+
+    st.selectbox(
+        "Разбиение субтитров",
+        options=list(SUBTITLE_SPLIT_LABELS.keys()),
+        index=3,
+        key=subtitle_split_key,
+        help="Уменьшает количество слов на экране. Тайминги внутри ASR-сегмента распределяются пропорционально."
+    )
+
+    if st.session_state.get(subtitle_mode_key) != "Вшить в видео":
+        return
+
+    sub_col_1, sub_col_2, sub_col_3 = st.columns(3)
+
+    with sub_col_1:
+        st.selectbox(
+            "Положение субтитров",
+            options=list(SUBTITLE_POSITION_LABELS.keys()),
+            key=subtitle_position_key
+        )
+
+    with sub_col_2:
+        st.slider(
+            "Размер субтитров",
+            min_value=16,
+            max_value=52,
+            value=28,
+            step=2,
+            key=subtitle_size_key
+        )
+
+    with sub_col_3:
+        current_position_label = st.session_state.get(subtitle_position_key, "Снизу")
+        st.slider(
+            "Отступ по вертикали",
+            min_value=0,
+            max_value=500,
+            value=default_subtitle_margin_for_position(current_position_label),
+            step=4,
+            key=f"subtitle_margin_{clip_id}",
+            help="Для нижнего положения это отступ от нижнего края."
+        )
+
+    style_col_1, style_col_2, style_col_3 = st.columns(3)
+
+    with style_col_1:
+        st.selectbox(
+            "Шрифт",
+            options=SUBTITLE_FONT_OPTIONS,
+            key=f"subtitle_font_{clip_id}"
+        )
+
+    with style_col_2:
+        st.color_picker(
+            "Цвет текста",
+            value="#FFFFFF",
+            key=f"subtitle_color_{clip_id}"
+        )
+
+    with style_col_3:
+        st.color_picker(
+            "Цвет обводки",
+            value="#000000",
+            key=f"subtitle_outline_color_{clip_id}"
+        )
+
+    effect_col_1, effect_col_2, effect_col_3 = st.columns(3)
+
+    with effect_col_1:
+        st.slider(
+            "Толщина обводки",
+            min_value=0,
+            max_value=8,
+            value=2,
+            step=1,
+            key=f"subtitle_outline_width_{clip_id}"
+        )
+
+    with effect_col_2:
+        st.slider(
+            "Тень",
+            min_value=0,
+            max_value=5,
+            value=1,
+            step=1,
+            key=f"subtitle_shadow_{clip_id}"
+        )
+
+    with effect_col_3:
+        st.selectbox(
+            "Анимация burn-in",
+            options=list(SUBTITLE_ANIMATION_LABELS.keys()),
+            key=f"subtitle_animation_{clip_id}",
+            help="Анимация применяется только при вшивании субтитров в видео."
+        )
+
+
+def generate_srt_for_clip(seg, fw_segments, project_dir: Path, subtitle_split_mode: str = "segment", subdir: str = "selected_subtitles"):
+    out_dir = project_dir / subdir
     out_dir.mkdir(exist_ok=True, parents=True)
 
     clip_id = seg["id"]
     title = ui_safe_filename(seg.get("title") or f"clip_{clip_id}")
     start = float(seg["start"])
     end = float(seg["end"])
+    subtitle_split_mode = normalize_subtitle_split_mode(subtitle_split_mode)
 
-    srt_path = out_dir / f"clip_{clip_id:03d}_{title}.srt"
+    srt_path = out_dir / f"clip_{int(clip_id):03d}_{title}_{subtitle_split_mode}.srt"
 
     build_srt_for_clip(
         whisper_segments=fw_segments,
         clip_start=start,
         clip_end=end,
-        srt_path=srt_path
+        srt_path=srt_path,
+        subtitle_split_mode=subtitle_split_mode
     )
 
+    return srt_path
+
+
+def ensure_srt_for_export(
+    seg,
+    fw_segments,
+    project_dir: Path,
+    subtitle_mode: str,
+    subtitle_split_mode: str,
+    cache_id,
+    subdir: str = "selected_subtitles",
+    cache_namespace: str = "clip",
+):
+    if subtitle_mode == "Не добавлять":
+        return None
+
+    st.session_state.setdefault("generated_srt_by_clip", {})
+    cache_key = subtitle_cache_key(cache_id, subtitle_split_mode, namespace=cache_namespace)
+    saved_srt = st.session_state.generated_srt_by_clip.get(cache_key)
+
+    if saved_srt and Path(saved_srt).exists():
+        return Path(saved_srt)
+
+    srt_path = generate_srt_for_clip(
+        seg=seg,
+        fw_segments=fw_segments,
+        project_dir=project_dir,
+        subtitle_split_mode=subtitle_split_mode,
+        subdir=subdir,
+    )
+    st.session_state.generated_srt_by_clip[cache_key] = str(srt_path)
     return srt_path
 
 
@@ -973,7 +1370,11 @@ def find_asr_ids_for_range(fw_segments, clip_start: float, clip_end: float):
 
 def clear_clip_outputs(clip_id):
     clip_key = str(clip_id)
-    st.session_state.setdefault("generated_srt_by_clip", {}).pop(clip_key, None)
+    generated_srt = st.session_state.setdefault("generated_srt_by_clip", {})
+    for key in list(generated_srt):
+        key_text = str(key)
+        if key_text == clip_key or key_text.startswith(f"{clip_key}:") or key_text.startswith(f"clip:{clip_key}:"):
+            generated_srt.pop(key, None)
     st.session_state.setdefault("exported_clip_by_clip", {}).pop(clip_key, None)
     st.session_state.setdefault("preview_clip_by_clip", {}).pop(clip_key, None)
 
@@ -1012,6 +1413,299 @@ def apply_clip_boundaries(position: int, new_start: float, new_end: float, fw_se
     clear_clip_outputs(clip_id)
     save_json(Path(st.session_state.project_dir) / "topic_segmentation" / "topic_segments_edited.json", st.session_state.topic_segments)
     return seg
+
+
+def filter_segments_for_range(fw_segments, clip_start: float, clip_end: float):
+    filtered = []
+
+    for seg in fw_segments:
+        seg_start = float(seg.get("start", 0) or 0)
+        seg_end = float(seg.get("end", seg_start) or seg_start)
+
+        if seg_end > clip_start and seg_start < clip_end:
+            filtered.append(dict(seg))
+
+    return filtered
+
+
+def chapter_shorts_cache_path(project_dir: Path, chapter_seg: dict, model_path: str, topic_mode: str) -> Path:
+    chapter_id = int(chapter_seg.get("id", 0) or 0)
+    model_key = ui_safe_filename(Path(model_path).stem, max_len=70)
+    mode_key = str(topic_mode or "fast")
+    return project_dir / "topic_segmentation" / "chapter_shorts" / f"chapter_{chapter_id:03d}_shorts_{mode_key}_{model_key}.json"
+
+
+def format_short_label(index: int, short: dict) -> str:
+    title = str(short.get("title") or f"Short {index + 1}").strip()
+    if len(title) > 42:
+        title = title[:42] + "..."
+    return f"{index + 1}. score {float(short.get('score', 0) or 0):.2f} · {format_timestamp(short.get('start', 0))}-{format_timestamp(short.get('end', 0))} · {title}"
+
+
+def render_chapter_shorts_panel(selected_seg, fw_segments, project_dir: Path):
+    chapter_id = int(selected_seg.get("id", 0) or 0)
+    selected_model_path = str(st.session_state.get("gpt4all_model_path") or GPT4ALL_MODEL_PATH)
+    topic_mode = st.session_state.get("topic_mode", "fast")
+    is_fast_topic_mode = topic_mode == "fast"
+    cache_path = chapter_shorts_cache_path(project_dir, selected_seg, selected_model_path, topic_mode)
+    session_key = f"chapter_shorts_{chapter_id}_{topic_mode}_{ui_safe_filename(Path(selected_model_path).stem, max_len=70)}"
+
+    with st.expander("Shorts внутри выбранной главы", expanded=False):
+        st.caption(
+            "Ищет короткие смысловые фрагменты только внутри выбранной главы. "
+            "Список глав и F1 по главам не перезаписываются."
+        )
+        st.caption(f"Кэш: `{cache_path}`")
+
+        shorts = st.session_state.get(session_key)
+        if shorts is None:
+            cached = read_json_if_exists(str(cache_path))
+            shorts = cached if isinstance(cached, list) else []
+            st.session_state[session_key] = shorts
+
+        run_col, reload_col = st.columns(2)
+
+        with run_col:
+            if st.button("Найти Shorts в этой главе", use_container_width=True, key=f"find_chapter_shorts_{chapter_id}"):
+                chapter_start = float(selected_seg.get("start", 0) or 0)
+                chapter_end = float(selected_seg.get("end", chapter_start) or chapter_start)
+                chapter_segments = filter_segments_for_range(fw_segments, chapter_start, chapter_end)
+
+                if len(chapter_segments) < 3:
+                    st.warning("В главе слишком мало ASR-сегментов для поиска Shorts.")
+                elif GPT4All is None:
+                    st.error("gpt4all не установлен.")
+                elif not Path(selected_model_path).exists():
+                    st.error(f"Модель GPT4All не найдена: {selected_model_path}")
+                else:
+                    with st.spinner("Ищу Shorts внутри выбранной главы..."):
+                        try:
+                            model = load_gpt4all_model(n_ctx=4096, model_path=selected_model_path)
+                            raw_shorts = llm_topic_segmentation(
+                                whisper_segments=chapter_segments,
+                                model=model,
+                                max_segments_per_window=TOPIC_FAST_MAX_SEGMENTS_PER_WINDOW if is_fast_topic_mode else TOPIC_MAX_SEGMENTS_PER_WINDOW,
+                                overlap_segments=TOPIC_FAST_OVERLAP_SEGMENTS if is_fast_topic_mode else TOPIC_OVERLAP_SEGMENTS,
+                                min_topic_duration_sec=8.0,
+                                max_topic_duration_sec=180.0,
+                                fast_mode=is_fast_topic_mode,
+                                generate_metadata=bool(st.session_state.get("generate_topic_metadata", False)),
+                                topic_max_tokens=GPT4ALL_FAST_TOPIC_MAX_TOKENS if is_fast_topic_mode else GPT4ALL_TOPIC_MAX_TOKENS,
+                            )
+                        except Exception as e:
+                            raw_shorts = []
+                            st.error(f"Не удалось найти Shorts внутри главы: {e}")
+
+                    if raw_shorts:
+                        prepared = []
+                        for index, item in enumerate(raw_shorts, start=1):
+                            short = dict(item)
+                            short["id"] = chapter_id * 1000 + index
+                            short["short_id"] = index
+                            short["segment_kind"] = "chapter_short"
+                            short["parent_chapter_id"] = chapter_id
+                            short["parent_chapter_title"] = selected_seg.get("title")
+                            short["parent_chapter_start"] = chapter_start
+                            short["parent_chapter_end"] = chapter_end
+                            prepared.append(short)
+
+                        cache_path.parent.mkdir(exist_ok=True, parents=True)
+                        save_json(cache_path, prepared)
+                        st.session_state[session_key] = prepared
+                        st.success(f"Найдено Shorts: {len(prepared)}")
+                        st.rerun()
+                    elif "raw_shorts" in locals():
+                        st.warning("Shorts внутри этой главы не найдены.")
+
+        with reload_col:
+            if st.button("Загрузить сохраненные Shorts", use_container_width=True, key=f"load_chapter_shorts_{chapter_id}"):
+                cached = read_json_if_exists(str(cache_path))
+                if isinstance(cached, list) and cached:
+                    st.session_state[session_key] = cached
+                    st.success(f"Загружено Shorts: {len(cached)}")
+                    st.rerun()
+                else:
+                    st.info("Сохраненных Shorts для этой главы пока нет.")
+
+        shorts = st.session_state.get(session_key) or []
+        if not shorts:
+            st.info("Shorts внутри выбранной главы пока не найдены.")
+            return
+
+        short_rows = [
+            {
+                "#": index,
+                "score": round(float(short.get("score", 0) or 0), 3),
+                "start": format_timestamp(short.get("start", 0)),
+                "end": format_timestamp(short.get("end", 0)),
+                "duration": round(float(short.get("duration", 0) or 0), 1),
+                "title": short.get("title", ""),
+            }
+            for index, short in enumerate(shorts, start=1)
+        ]
+        st.dataframe(short_rows, use_container_width=True, hide_index=True)
+
+        selected_short_index = st.radio(
+            "Выбранный Short",
+            options=list(range(len(shorts))),
+            format_func=lambda index: format_short_label(index, shorts[index]),
+            key=f"selected_chapter_short_{chapter_id}"
+        )
+        selected_short = dict(shorts[selected_short_index])
+        try:
+            short_number = int(selected_short.get("short_id") or selected_short_index + 1)
+        except (TypeError, ValueError):
+            short_number = selected_short_index + 1
+        selected_short["short_id"] = short_number
+        selected_short.setdefault("id", chapter_id * 1000 + short_number)
+        selected_short.setdefault("segment_kind", "chapter_short")
+        st.write(
+            f"**{selected_short.get('title') or f'Short {selected_short_index + 1}'}** · "
+            f"{format_timestamp(selected_short.get('start', 0))}-{format_timestamp(selected_short.get('end', 0))} · "
+            f"score {float(selected_short.get('score', 0) or 0):.2f}"
+        )
+        st.text_area(
+            "Текст выбранного Short",
+            value=selected_short.get("text", ""),
+            height=140,
+            key=f"selected_chapter_short_text_{chapter_id}_{selected_short_index}",
+            disabled=True,
+        )
+
+        short_id = selected_short.get("short_id", selected_short_index + 1)
+        short_cache_id = f"chapter_short_{chapter_id}_{short_id}"
+        short_namespace = "chapter_short"
+        short_subdir = "selected_subtitles/chapter_shorts"
+        st.session_state.setdefault("generated_srt_by_clip", {})
+        st.session_state.setdefault("exported_clip_by_clip", {})
+        st.session_state.setdefault("preview_clip_by_clip", {})
+
+        with st.expander("Настройки предпросмотра и экспорта Short", expanded=False):
+            render_export_settings_controls(short_cache_id)
+
+        short_action_col_1, short_action_col_2, short_action_col_3 = st.columns(3)
+
+        with short_action_col_1:
+            if st.button("Сгенерировать SRT для Short", use_container_width=True, key=f"srt_chapter_short_{chapter_id}_{short_id}"):
+                _, _, _, _, subtitle_split_mode, _ = get_export_settings_for_clip(short_cache_id)
+
+                with st.spinner("Генерирую SRT для выбранного Short..."):
+                    srt_path = generate_srt_for_clip(
+                        seg=selected_short,
+                        fw_segments=fw_segments,
+                        project_dir=project_dir,
+                        subtitle_split_mode=subtitle_split_mode,
+                        subdir=short_subdir,
+                    )
+
+                st.session_state.generated_srt_by_clip[
+                    subtitle_cache_key(short_cache_id, subtitle_split_mode, namespace=short_namespace)
+                ] = str(srt_path)
+                st.success(f"SRT для Short создан: {srt_path}")
+
+        with short_action_col_2:
+            if st.button("Собрать предпросмотр Short", use_container_width=True, key=f"preview_chapter_short_{chapter_id}_{short_id}"):
+                aspect_mode, subtitle_mode, subtitle_position, subtitle_size, subtitle_split_mode, subtitle_style = get_export_settings_for_clip(short_cache_id)
+
+                with st.spinner("Собираю предпросмотр Short..."):
+                    try:
+                        srt_path = ensure_srt_for_export(
+                            seg=selected_short,
+                            fw_segments=fw_segments,
+                            project_dir=project_dir,
+                            subtitle_mode=subtitle_mode,
+                            subtitle_split_mode=subtitle_split_mode,
+                            cache_id=short_cache_id,
+                            subdir=short_subdir,
+                            cache_namespace=short_namespace,
+                        ) if subtitle_mode == "Вшить в видео" else None
+                        preview_path = export_clip_with_optional_srt(
+                            video_path=Path(st.session_state.video_path),
+                            seg=selected_short,
+                            out_dir=project_dir / "previews" / "chapter_shorts",
+                            srt_path=srt_path,
+                            burn_subtitles=subtitle_mode == "Вшить в видео",
+                            aspect_mode=aspect_mode,
+                            subtitle_position=subtitle_position,
+                            subtitle_font_size=subtitle_size,
+                            **subtitle_style,
+                        )
+                        st.session_state.preview_clip_by_clip[short_cache_id] = str(preview_path)
+                        st.success(f"Предпросмотр Short создан: {preview_path}")
+                    except Exception as e:
+                        st.error(f"Не удалось собрать предпросмотр Short: {e}")
+
+        with short_action_col_3:
+            if st.button("Экспортировать Short", type="primary", use_container_width=True, key=f"export_chapter_short_{chapter_id}_{short_id}"):
+                aspect_mode, subtitle_mode, subtitle_position, subtitle_size, subtitle_split_mode, subtitle_style = get_export_settings_for_clip(short_cache_id)
+
+                with st.spinner("Экспортирую выбранный Short..."):
+                    try:
+                        srt_path = ensure_srt_for_export(
+                            seg=selected_short,
+                            fw_segments=fw_segments,
+                            project_dir=project_dir,
+                            subtitle_mode=subtitle_mode,
+                            subtitle_split_mode=subtitle_split_mode,
+                            cache_id=short_cache_id,
+                            subdir=short_subdir,
+                            cache_namespace=short_namespace,
+                        )
+                        clip_path = export_clip_with_optional_srt(
+                            video_path=Path(st.session_state.video_path),
+                            seg=selected_short,
+                            out_dir=project_dir / "exports" / "chapter_shorts",
+                            srt_path=srt_path,
+                            burn_subtitles=subtitle_mode == "Вшить в видео",
+                            aspect_mode=aspect_mode,
+                            subtitle_position=subtitle_position,
+                            subtitle_font_size=subtitle_size,
+                            **subtitle_style,
+                        )
+
+                        st.session_state.exported_clip_by_clip[short_cache_id] = str(clip_path)
+                        st.success(f"Short экспортирован: {clip_path}")
+                    except Exception as e:
+                        st.error(f"Не удалось экспортировать Short: {e}")
+
+        short_split_label = st.session_state.get(f"subtitle_split_{short_cache_id}", "3 слова")
+        short_split_mode = SUBTITLE_SPLIT_LABELS.get(short_split_label, "words_3")
+        short_srt = st.session_state.generated_srt_by_clip.get(
+            subtitle_cache_key(short_cache_id, short_split_mode, namespace=short_namespace)
+        )
+        short_export = st.session_state.exported_clip_by_clip.get(short_cache_id)
+        short_preview = st.session_state.preview_clip_by_clip.get(short_cache_id)
+
+        if short_srt and Path(short_srt).exists():
+            srt_path = Path(short_srt)
+
+            with open(srt_path, "rb") as f:
+                st.download_button(
+                    label="Скачать SRT Short",
+                    data=f,
+                    file_name=srt_path.name,
+                    mime="text/plain",
+                    use_container_width=True,
+                    key=f"download_srt_chapter_short_{chapter_id}_{short_id}",
+                )
+
+        if short_export and Path(short_export).exists():
+            clip_path = Path(short_export)
+            st.video(str(clip_path))
+
+            with open(clip_path, "rb") as f:
+                st.download_button(
+                    label="Скачать экспортированный Short MP4",
+                    data=f,
+                    file_name=clip_path.name,
+                    mime="video/mp4",
+                    use_container_width=True,
+                    key=f"download_export_chapter_short_{chapter_id}_{short_id}",
+                )
+
+        elif short_preview and Path(short_preview).exists():
+            st.caption("Предпросмотр выбранного Short")
+            st.video(str(short_preview))
 
 
 # =========================
@@ -1222,76 +1916,31 @@ def render_workspace():
             height=220
         )
 
+        if is_chapter_goal:
+            render_chapter_shorts_panel(
+                selected_seg=selected_seg,
+                fw_segments=fw_segments,
+                project_dir=Path(st.session_state.project_dir),
+            )
+
         with st.expander("Настройки предпросмотра и экспорта", expanded=False):
-            aspect_key = f"aspect_{selected_clip_id}"
-            subtitle_mode_key = f"subtitle_mode_{selected_clip_id}"
-            subtitle_position_key = f"subtitle_position_{selected_clip_id}"
-            subtitle_size_key = f"subtitle_size_{selected_clip_id}"
-
-            st.radio(
-                "Формат видео",
-                options=["Оригинальный", "Вертикальный 9:16"],
-                horizontal=True,
-                key=aspect_key
-            )
-
-            st.radio(
-                "Субтитры при экспорте",
-                options=["Не добавлять", "Отдельный SRT рядом", "Вшить в видео"],
-                horizontal=True,
-                index=1,
-                key=subtitle_mode_key
-            )
-
-            if st.session_state.get(subtitle_mode_key) == "Вшить в видео":
-                sub_col_1, sub_col_2 = st.columns(2)
-
-                with sub_col_1:
-                    st.selectbox(
-                        "Положение субтитров",
-                        options=["Снизу", "Выше снизу", "По центру"],
-                        key=subtitle_position_key
-                    )
-
-                with sub_col_2:
-                    st.slider(
-                        "Размер субтитров",
-                        min_value=16,
-                        max_value=52,
-                        value=28,
-                        step=2,
-                        key=subtitle_size_key
-                    )
+            render_export_settings_controls(selected_clip_id)
 
         def get_export_settings():
-            aspect_mode = "vertical_9_16" if st.session_state.get(f"aspect_{selected_clip_id}") == "Вертикальный 9:16" else "original"
-            subtitle_mode = st.session_state.get(f"subtitle_mode_{selected_clip_id}", "Отдельный SRT рядом")
-            subtitle_position_label = st.session_state.get(f"subtitle_position_{selected_clip_id}", "Снизу")
-            subtitle_position = {
-                "Снизу": "bottom",
-                "Выше снизу": "upper_bottom",
-                "По центру": "center",
-            }.get(subtitle_position_label, "bottom")
-            subtitle_size = int(st.session_state.get(f"subtitle_size_{selected_clip_id}", 28))
+            return get_export_settings_for_clip(selected_clip_id)
 
-            return aspect_mode, subtitle_mode, subtitle_position, subtitle_size
-
-        def ensure_srt_if_needed(seg, subtitle_mode):
-            if subtitle_mode == "Не добавлять":
-                return None
-
-            saved_srt = st.session_state.generated_srt_by_clip.get(str(selected_clip_id))
-
-            if saved_srt and Path(saved_srt).exists():
-                return Path(saved_srt)
-
-            srt_path = generate_srt_for_clip(
+        def ensure_srt_if_needed(seg, subtitle_mode, subtitle_split_mode):
+            return ensure_srt_for_export(
                 seg=seg,
                 fw_segments=fw_segments,
-                project_dir=Path(st.session_state.project_dir)
+                project_dir=Path(st.session_state.project_dir),
+                subtitle_mode=subtitle_mode,
+                subtitle_split_mode=subtitle_split_mode,
+                cache_id=selected_clip_id,
             )
-            st.session_state.generated_srt_by_clip[str(selected_clip_id)] = str(srt_path)
-            return srt_path
+
+        preview_button_label = "Собрать предпросмотр главы" if is_chapter_goal else "Собрать предпросмотр"
+        export_button_label = "Экспортировать главу" if is_chapter_goal else "Экспортировать клип"
 
         action_col_1, action_col_2, action_col_3, action_col_4 = st.columns(4)
 
@@ -1303,25 +1952,27 @@ def render_workspace():
         with action_col_2:
             if st.button("Сгенерировать SRT", use_container_width=True):
                 seg = apply_widget_values_to_segment(selected_position)
+                _, _, _, _, subtitle_split_mode, _ = get_export_settings()
 
                 with st.spinner("Генерирую SRT по таймкодам faster-whisper..."):
                     srt_path = generate_srt_for_clip(
                         seg=seg,
                         fw_segments=fw_segments,
-                        project_dir=Path(st.session_state.project_dir)
-                    )
+                        project_dir=Path(st.session_state.project_dir),
+                        subtitle_split_mode=subtitle_split_mode
+                )
 
-                st.session_state.generated_srt_by_clip[str(selected_clip_id)] = str(srt_path)
+                st.session_state.generated_srt_by_clip[subtitle_cache_key(selected_clip_id, subtitle_split_mode)] = str(srt_path)
                 st.success(f"SRT создан: {srt_path}")
 
         with action_col_3:
-            if st.button("Собрать предпросмотр", use_container_width=True):
+            if st.button(preview_button_label, use_container_width=True):
                 seg = apply_widget_values_to_segment(selected_position)
-                aspect_mode, subtitle_mode, subtitle_position, subtitle_size = get_export_settings()
+                aspect_mode, subtitle_mode, subtitle_position, subtitle_size, subtitle_split_mode, subtitle_style = get_export_settings()
 
                 with st.spinner("Собираю предпросмотр клипа..."):
                     try:
-                        srt_path = ensure_srt_if_needed(seg, subtitle_mode) if subtitle_mode == "Вшить в видео" else None
+                        srt_path = ensure_srt_if_needed(seg, subtitle_mode, subtitle_split_mode) if subtitle_mode == "Вшить в видео" else None
                         preview_path = export_clip_with_optional_srt(
                             video_path=Path(st.session_state.video_path),
                             seg=seg,
@@ -1330,7 +1981,8 @@ def render_workspace():
                             burn_subtitles=subtitle_mode == "Вшить в видео",
                             aspect_mode=aspect_mode,
                             subtitle_position=subtitle_position,
-                            subtitle_font_size=subtitle_size
+                            subtitle_font_size=subtitle_size,
+                            **subtitle_style,
                         )
                         st.session_state.preview_clip_by_clip[str(selected_clip_id)] = str(preview_path)
                         st.success(f"Предпросмотр создан: {preview_path}")
@@ -1338,13 +1990,13 @@ def render_workspace():
                         st.error(f"Не удалось собрать предпросмотр: {e}")
 
         with action_col_4:
-            if st.button("Экспортировать клип", type="primary", use_container_width=True):
+            if st.button(export_button_label, type="primary", use_container_width=True):
                 seg = apply_widget_values_to_segment(selected_position)
-                aspect_mode, subtitle_mode, subtitle_position, subtitle_size = get_export_settings()
+                aspect_mode, subtitle_mode, subtitle_position, subtitle_size, subtitle_split_mode, subtitle_style = get_export_settings()
 
                 with st.spinner("Экспортирую выбранный клип..."):
                     try:
-                        srt_path = ensure_srt_if_needed(seg, subtitle_mode)
+                        srt_path = ensure_srt_if_needed(seg, subtitle_mode, subtitle_split_mode)
                         clip_path = export_clip_with_optional_srt(
                             video_path=Path(st.session_state.video_path),
                             seg=seg,
@@ -1353,7 +2005,8 @@ def render_workspace():
                             burn_subtitles=subtitle_mode == "Вшить в видео",
                             aspect_mode=aspect_mode,
                             subtitle_position=subtitle_position,
-                            subtitle_font_size=subtitle_size
+                            subtitle_font_size=subtitle_size,
+                            **subtitle_style,
                         )
 
                         st.session_state.exported_clip_by_clip[str(selected_clip_id)] = str(clip_path)
@@ -1362,7 +2015,9 @@ def render_workspace():
                     except Exception as e:
                         st.error(f"Не удалось экспортировать клип: {e}")
 
-        current_srt = st.session_state.generated_srt_by_clip.get(str(selected_clip_id))
+        current_split_label = st.session_state.get(f"subtitle_split_{selected_clip_id}", "3 слова")
+        current_split_mode = SUBTITLE_SPLIT_LABELS.get(current_split_label, "words_3")
+        current_srt = st.session_state.generated_srt_by_clip.get(subtitle_cache_key(selected_clip_id, current_split_mode))
         current_export = st.session_state.exported_clip_by_clip.get(str(selected_clip_id))
         current_preview = st.session_state.preview_clip_by_clip.get(str(selected_clip_id))
 
@@ -1790,6 +2445,52 @@ def render_timestamp_evaluation():
                 st.write("FN: пропущенные сегменты")
                 st.dataframe(false_negative_rows, use_container_width=True, hide_index=True)
 
+            if st.session_state.get("project_dir"):
+                eval_json_path = Path(st.session_state.project_dir) / "timestamp_evaluation_report.json"
+                eval_txt_path = Path(st.session_state.project_dir) / "timestamp_evaluation_report.txt"
+                eval_report = {
+                    "reference_label": reference_label,
+                    "prediction_label": prediction_label,
+                    "iou_threshold": iou_threshold,
+                    "metrics": {
+                        "tp": result["tp"],
+                        "fp": result["fp"],
+                        "fn": result["fn"],
+                        "precision": result["precision"],
+                        "recall": result["recall"],
+                        "f1": result["f1"],
+                    },
+                    "quick_metrics": quick_rows,
+                    "matches": match_rows,
+                    "false_positives": false_positive_rows,
+                    "false_negatives": false_negative_rows,
+                }
+                save_json(eval_json_path, eval_report)
+                eval_lines = [
+                    "F1 ОЦЕНКА ТАЙМИНГОВ",
+                    "===================",
+                    "",
+                    f"Эталон: {reference_label}",
+                    f"Сравниваем: {prediction_label}",
+                    f"IoU threshold: {iou_threshold:.2f}",
+                    "",
+                    f"TP: {result['tp']}",
+                    f"FP: {result['fp']}",
+                    f"FN: {result['fn']}",
+                    f"Precision: {result['precision']:.3f}",
+                    f"Recall: {result['recall']:.3f}",
+                    f"F1: {result['f1']:.3f}",
+                    "",
+                    "Быстрое сравнение:",
+                ]
+                for row in quick_rows:
+                    eval_lines.append(
+                        f"IoU {row['IoU']}: TP={row['TP']} FP={row['FP']} FN={row['FN']} "
+                        f"Precision={row['Precision']} Recall={row['Recall']} F1={row['F1']}"
+                    )
+                eval_txt_path.write_text("\n".join(eval_lines), encoding="utf-8")
+                st.caption(f"F1 отчет сохранен: `{eval_txt_path}`")
+
 
 # =========================
 # MAIN UI
@@ -2046,6 +2747,8 @@ if st.session_state.get("video_path"):
             "Сохраняются только промежуточные данные анализа. "
             "MP4-файл выбранного клипа создается только после нажатия кнопки «Экспортировать клип»."
         )
+
+    render_pipeline_report(project_dir)
 
 render_timestamp_evaluation()
 

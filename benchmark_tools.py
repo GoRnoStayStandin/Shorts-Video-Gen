@@ -1,13 +1,16 @@
 print("RUNNING FILE:", __file__)
 
 import gc
+import csv
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -478,6 +481,295 @@ def get_nvidia_gpu_snapshot() -> Dict:
         }
     except Exception as e:
         return {"gpu_error": str(e)}
+
+
+class ResourceMonitor:
+    def __init__(self, out_dir: Path, interval_sec: float = 2.0):
+        self.out_dir = Path(out_dir)
+        self.interval_sec = max(0.5, float(interval_sec))
+        self.samples_path = self.out_dir / "resource_samples.csv"
+        self.summary_path = self.out_dir / "resource_summary.json"
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._stage = "starting"
+        self._samples: List[Dict] = []
+        self._start_perf = 0.0
+        self._start_iso = ""
+        self._disk_start = None
+        self._process = None
+
+    def set_stage(self, stage: str):
+        with self._lock:
+            self._stage = str(stage or "unknown")
+
+    def start(self):
+        self.out_dir.mkdir(exist_ok=True, parents=True)
+        self._start_perf = time.perf_counter()
+        self._start_iso = datetime.now().isoformat(timespec="seconds")
+        self._stop_event.clear()
+
+        if psutil is not None:
+            self._process = psutil.Process(os.getpid())
+            self._disk_start = psutil.disk_io_counters()
+            psutil.cpu_percent(interval=None)
+
+        self._write_header()
+        self._thread = threading.Thread(target=self._run, name="resource-monitor", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> Dict:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_sec + 1.0))
+            self._thread = None
+
+        summary = self.build_summary()
+        save_json(self.summary_path, summary)
+        return summary
+
+    def _fieldnames(self) -> List[str]:
+        return [
+            "timestamp",
+            "elapsed_sec",
+            "stage",
+            "cpu_percent",
+            "ram_used_mb",
+            "ram_available_mb",
+            "ram_percent",
+            "process_rss_mb",
+            "disk_read_mb",
+            "disk_write_mb",
+            "gpu_name",
+            "gpu_util_percent",
+            "gpu_memory_used_mb",
+            "gpu_memory_total_mb",
+            "gpu_temperature_c",
+            "gpu_error",
+        ]
+
+    def _write_header(self):
+        with self.samples_path.open("w", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=self._fieldnames()).writeheader()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            self.sample_once()
+            self._stop_event.wait(self.interval_sec)
+
+        self.sample_once()
+
+    def sample_once(self) -> Dict:
+        with self._lock:
+            stage = self._stage
+
+        sample: Dict = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_sec": round(time.perf_counter() - self._start_perf, 3) if self._start_perf else 0.0,
+            "stage": stage,
+        }
+
+        if psutil is not None:
+            vm = psutil.virtual_memory()
+            sample.update({
+                "cpu_percent": psutil.cpu_percent(interval=None),
+                "ram_used_mb": round(vm.used / (1024 * 1024), 1),
+                "ram_available_mb": round(vm.available / (1024 * 1024), 1),
+                "ram_percent": vm.percent,
+            })
+
+            if self._process is not None:
+                try:
+                    sample["process_rss_mb"] = round(self._process.memory_info().rss / (1024 * 1024), 1)
+                except Exception:
+                    sample["process_rss_mb"] = None
+
+            disk_now = psutil.disk_io_counters()
+            if disk_now is not None and self._disk_start is not None:
+                sample["disk_read_mb"] = round((disk_now.read_bytes - self._disk_start.read_bytes) / (1024 * 1024), 1)
+                sample["disk_write_mb"] = round((disk_now.write_bytes - self._disk_start.write_bytes) / (1024 * 1024), 1)
+
+        sample.update(get_nvidia_gpu_snapshot())
+
+        row = {key: sample.get(key) for key in self._fieldnames()}
+        with self.samples_path.open("a", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=self._fieldnames()).writerow(row)
+
+        self._samples.append(row)
+        return row
+
+    def build_summary(self) -> Dict:
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        elapsed_sec = round(time.perf_counter() - self._start_perf, 3) if self._start_perf else 0.0
+
+        def numeric_values(key: str, stage: Optional[str] = None) -> List[float]:
+            values = []
+            for sample in self._samples:
+                if stage is not None and sample.get("stage") != stage:
+                    continue
+                value = sample.get(key)
+                try:
+                    if value is not None and str(value).strip() != "":
+                        values.append(float(value))
+                except Exception:
+                    continue
+            return values
+
+        def peak(key: str, stage: Optional[str] = None) -> Optional[float]:
+            values = numeric_values(key, stage=stage)
+            return round(max(values), 3) if values else None
+
+        def average(key: str, stage: Optional[str] = None) -> Optional[float]:
+            values = numeric_values(key, stage=stage)
+            return round(sum(values) / len(values), 3) if values else None
+
+        stages = sorted({str(sample.get("stage")) for sample in self._samples if sample.get("stage")})
+        stage_summary = {}
+        for stage in stages:
+            stage_summary[stage] = {
+                "sample_count": len([sample for sample in self._samples if sample.get("stage") == stage]),
+                "cpu_percent_avg": average("cpu_percent", stage=stage),
+                "cpu_percent_peak": peak("cpu_percent", stage=stage),
+                "ram_used_mb_peak": peak("ram_used_mb", stage=stage),
+                "process_rss_mb_peak": peak("process_rss_mb", stage=stage),
+                "gpu_util_percent_avg": average("gpu_util_percent", stage=stage),
+                "gpu_util_percent_peak": peak("gpu_util_percent", stage=stage),
+                "gpu_memory_used_mb_peak": peak("gpu_memory_used_mb", stage=stage),
+                "gpu_temperature_c_peak": peak("gpu_temperature_c", stage=stage),
+            }
+
+        return {
+            "started_at": self._start_iso,
+            "ended_at": ended_at,
+            "elapsed_sec": elapsed_sec,
+            "sample_count": len(self._samples),
+            "samples_csv": str(self.samples_path),
+            "summary_json": str(self.summary_path),
+            "cpu_percent_avg": average("cpu_percent"),
+            "cpu_percent_peak": peak("cpu_percent"),
+            "ram_percent_peak": peak("ram_percent"),
+            "ram_used_mb_peak": peak("ram_used_mb"),
+            "ram_available_mb_min": min(numeric_values("ram_available_mb")) if numeric_values("ram_available_mb") else None,
+            "process_rss_mb_peak": peak("process_rss_mb"),
+            "disk_read_mb_total": peak("disk_read_mb"),
+            "disk_write_mb_total": peak("disk_write_mb"),
+            "gpu_name": next((sample.get("gpu_name") for sample in self._samples if sample.get("gpu_name")), None),
+            "gpu_util_percent_avg": average("gpu_util_percent"),
+            "gpu_util_percent_peak": peak("gpu_util_percent"),
+            "gpu_memory_used_mb_peak": peak("gpu_memory_used_mb"),
+            "gpu_memory_total_mb": peak("gpu_memory_total_mb"),
+            "gpu_temperature_c_peak": peak("gpu_temperature_c"),
+            "gpu_error": next((sample.get("gpu_error") for sample in self._samples if sample.get("gpu_error")), None),
+            "stages": stage_summary,
+        }
+
+
+def format_seconds_compact(seconds) -> str:
+    try:
+        seconds = int(round(float(seconds or 0)))
+    except Exception:
+        seconds = 0
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours:
+        return f"{hours}ч {minutes:02d}м {secs:02d}с"
+    if minutes:
+        return f"{minutes}м {secs:02d}с"
+    return f"{secs}с"
+
+
+def write_pipeline_text_report(path: Path, report: Dict):
+    resource = report.get("resource_summary") or {}
+    context = report.get("context") or {}
+    stage_times = report.get("stage_times_sec") or {}
+    stages = resource.get("stages") or {}
+
+    def fmt_value(value, suffix=""):
+        if value is None or str(value).strip() == "":
+            return "нет данных"
+        try:
+            return f"{float(value):.1f}{suffix}"
+        except Exception:
+            return f"{value}{suffix}"
+
+    def stage_line(stage_key: str, label: str) -> str:
+        data = stages.get(stage_key) or {}
+        duration = stage_times.get(stage_key)
+        return (
+            f"- {label}: время {format_seconds_compact(duration)}, "
+            f"CPU avg/peak {fmt_value(data.get('cpu_percent_avg'), '%')}/{fmt_value(data.get('cpu_percent_peak'), '%')}, "
+            f"GPU avg/peak {fmt_value(data.get('gpu_util_percent_avg'), '%')}/{fmt_value(data.get('gpu_util_percent_peak'), '%')}, "
+            f"VRAM peak {fmt_value(data.get('gpu_memory_used_mb_peak'), ' MB')}, "
+            f"RAM peak {fmt_value(data.get('ram_used_mb_peak'), ' MB')}"
+        )
+
+    lines = [
+        "ОТЧЕТ ПРОГОНА",
+        "============",
+        "",
+        f"Статус: {report.get('status', 'unknown')}",
+        f"Сообщение: {report.get('message', '')}",
+        f"Начало: {report.get('started_at', '')}",
+        f"Конец: {report.get('ended_at', '')}",
+        f"Общее время: {format_seconds_compact(report.get('elapsed_sec'))} ({fmt_value(report.get('elapsed_sec'), ' сек')})",
+        "",
+        "Модель и режим:",
+        f"- Модель: {context.get('model_name', '')}",
+        f"- Путь модели: {context.get('model_path', '')}",
+        f"- Цель: {context.get('segmentation_goal_label', context.get('segmentation_goal', ''))}",
+        f"- Режим: {context.get('topic_mode_label', context.get('topic_mode', ''))}",
+        f"- Чувствительность глав: {context.get('chapter_sensitivity', '')}",
+        f"- Длительность видео: {format_seconds_compact(context.get('media_duration_sec'))}",
+        f"- ASR-сегментов: {context.get('asr_segment_count', '')}",
+        f"- Найдено сегментов/глав: {context.get('topic_segment_count', '')}",
+        "",
+        "GPU:",
+        f"- Название: {resource.get('gpu_name') or 'нет данных'}",
+        f"- Общий объем памяти: {fmt_value(resource.get('gpu_memory_total_mb'), ' MB')}",
+        f"- Максимум использовано памяти: {fmt_value(resource.get('gpu_memory_used_mb_peak'), ' MB')}",
+        f"- Нагрузка avg/peak: {fmt_value(resource.get('gpu_util_percent_avg'), '%')}/{fmt_value(resource.get('gpu_util_percent_peak'), '%')}",
+        f"- Максимальная температура: {fmt_value(resource.get('gpu_temperature_c_peak'), ' C')}",
+        f"- Ошибка GPU: {resource.get('gpu_error') or 'нет'}",
+        "",
+        "CPU:",
+        f"- Нагрузка avg/peak: {fmt_value(resource.get('cpu_percent_avg'), '%')}/{fmt_value(resource.get('cpu_percent_peak'), '%')}",
+        "",
+        "RAM:",
+        f"- Максимум использовано системой: {fmt_value(resource.get('ram_used_mb_peak'), ' MB')}",
+        f"- Минимум свободно: {fmt_value(resource.get('ram_available_mb_min'), ' MB')}",
+        f"- Максимум процесса Python: {fmt_value(resource.get('process_rss_mb_peak'), ' MB')}",
+        f"- Максимум процента RAM: {fmt_value(resource.get('ram_percent_peak'), '%')}",
+        "",
+        "Диск:",
+        f"- Прочитано: {fmt_value(resource.get('disk_read_mb_total'), ' MB')}",
+        f"- Записано: {fmt_value(resource.get('disk_write_mb_total'), ' MB')}",
+        "",
+        "Время работы по этапам:",
+    ]
+
+    for key, label in [
+        ("duration_probe", "Получение длительности"),
+        ("asr", "ASR"),
+        ("segmentation_setup", "Подготовка сегментации"),
+        ("model_load", "Загрузка GPT4All"),
+        ("llm_processing", "ИИ обработка"),
+        ("save_results", "Сохранение результатов"),
+    ]:
+        lines.append(stage_line(key, label))
+
+    lines.extend([
+        "",
+        "Файлы:",
+        f"- JSON отчет: {report.get('report_json_path', '')}",
+        f"- TXT отчет: {str(path)}",
+        f"- CSV семплы ресурсов: {resource.get('samples_csv', '')}",
+        f"- Resource summary: {resource.get('summary_json', '')}",
+    ])
+
+    path.parent.mkdir(exist_ok=True, parents=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 # =========================
@@ -3243,14 +3535,103 @@ def llm_chapter_segmentation(
 # SUBTITLES AND EXPORT
 # =========================
 
+def normalize_subtitle_split_mode(mode: str) -> str:
+    mode = str(mode or "segment").strip().lower()
+    aliases = {
+        "asr": "segment",
+        "asr_segment": "segment",
+        "segment": "segment",
+        "sentence": "sentence",
+        "sentences": "sentence",
+        "whole_sentence": "sentence",
+        "1": "words_1",
+        "word_1": "words_1",
+        "words_1": "words_1",
+        "2": "words_2",
+        "word_2": "words_2",
+        "words_2": "words_2",
+        "3": "words_3",
+        "word_3": "words_3",
+        "words_3": "words_3",
+        "5": "words_5",
+        "word_5": "words_5",
+        "words_5": "words_5",
+    }
+    return aliases.get(mode, "segment")
+
+
+def split_text_into_sentences(text: str) -> List[str]:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+
+    parts = [part.strip() for part in re.findall(r"[^.!?…]+[.!?…]*", text) if part.strip()]
+    return parts or [text]
+
+
+def split_text_for_subtitle_mode(text: str, mode: str) -> List[str]:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    mode = normalize_subtitle_split_mode(mode)
+
+    if not text:
+        return []
+
+    if mode == "sentence":
+        return split_text_into_sentences(text)
+
+    if mode.startswith("words_"):
+        try:
+            group_size = max(1, int(mode.rsplit("_", 1)[-1]))
+        except Exception:
+            group_size = 3
+
+        words = text.split()
+        return [" ".join(words[index:index + group_size]) for index in range(0, len(words), group_size)]
+
+    return [text]
+
+
+def build_timed_subtitle_parts(text: str, start: float, end: float, mode: str) -> List[Dict]:
+    parts = split_text_for_subtitle_mode(text, mode)
+    start = float(start)
+    end = float(end)
+    duration = max(0.0, end - start)
+
+    if not parts or duration <= 0:
+        return []
+
+    if len(parts) == 1:
+        return [{"start": start, "end": end, "text": parts[0]}]
+
+    weights = [max(1, len(part.split())) for part in parts]
+    total_weight = max(1, sum(weights))
+    timed_parts = []
+    cursor = start
+
+    for index, part in enumerate(parts):
+        if index + 1 == len(parts):
+            part_end = end
+        else:
+            part_end = start + duration * (sum(weights[:index + 1]) / total_weight)
+
+        if part_end > cursor:
+            timed_parts.append({"start": cursor, "end": part_end, "text": part})
+
+        cursor = part_end
+
+    return timed_parts
+
+
 def build_srt_for_clip(
     whisper_segments: List[Dict],
     clip_start: float,
     clip_end: float,
-    srt_path: Path
+    srt_path: Path,
+    subtitle_split_mode: str = "segment"
 ):
     srt_blocks = []
     idx = 1
+    subtitle_split_mode = normalize_subtitle_split_mode(subtitle_split_mode)
 
     for seg in whisper_segments:
         seg_start = float(seg["start"])
@@ -3266,35 +3647,173 @@ def build_srt_for_clip(
         if local_end <= local_start or not seg_text:
             continue
 
-        srt_blocks.append(
-            f"{idx}\n"
-            f"{format_srt_timestamp(local_start)} --> {format_srt_timestamp(local_end)}\n"
-            f"{seg_text}\n"
-        )
-        idx += 1
+        for part in build_timed_subtitle_parts(seg_text, local_start, local_end, subtitle_split_mode):
+            srt_blocks.append(
+                f"{idx}\n"
+                f"{format_srt_timestamp(part['start'])} --> {format_srt_timestamp(part['end'])}\n"
+                f"{part['text']}\n"
+            )
+            idx += 1
 
     srt_path.parent.mkdir(exist_ok=True, parents=True)
     srt_path.write_text("\n".join(srt_blocks), encoding="utf-8")
 
 
-def build_subtitle_filter(srt_path: Path, position: str = "bottom", font_size: int = 28) -> str:
-    srt_filter_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
+def hex_to_ass_color(value: str, default: str = "#FFFFFF") -> str:
+    value = str(value or default).strip()
+    if not re.match(r"^#[0-9a-fA-F]{6}$", value):
+        value = default
+    red = value[1:3]
+    green = value[3:5]
+    blue = value[5:7]
+    return f"&H00{blue}{green}{red}"
+
+
+def srt_time_to_ass_time(value: str) -> str:
+    match = re.match(r"(\d+):(\d{2}):(\d{2}),(\d{3})", str(value).strip())
+    if not match:
+        return "0:00:00.00"
+    hours, minutes, seconds, millis = match.groups()
+    centis = int(round(int(millis) / 10.0))
+    if centis >= 100:
+        centis = 99
+    return f"{int(hours)}:{minutes}:{seconds}.{centis:02d}"
+
+
+def parse_srt_blocks(srt_path: Path) -> List[Dict]:
+    text = srt_path.read_text(encoding="utf-8", errors="ignore")
+    blocks = []
+    for raw_block in re.split(r"\n\s*\n", text.strip()):
+        lines = [line.rstrip("\r") for line in raw_block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if re.match(r"^\d+$", lines[0].strip()):
+            lines = lines[1:]
+        if not lines or "-->" not in lines[0]:
+            continue
+        start_raw, end_raw = [part.strip().split()[0] for part in lines[0].split("-->", 1)]
+        blocks.append({
+            "start": srt_time_to_ass_time(start_raw),
+            "end": srt_time_to_ass_time(end_raw),
+            "text": "\\N".join(lines[1:]).replace("{", "(").replace("}", ")"),
+        })
+    return blocks
+
+
+def build_ass_from_srt(
+    srt_path: Path,
+    ass_path: Path,
+    position: str = "bottom",
+    font_size: int = 28,
+    font_name: str = "Arial",
+    primary_color: str = "#FFFFFF",
+    outline_color: str = "#000000",
+    outline_width: int = 2,
+    shadow: int = 1,
+    margin_v: Optional[int] = None,
+    animation: str = "none",
+) -> Path:
+    if position == "center":
+        alignment = 5
+        default_margin_v = 0
+    elif position == "upper_bottom":
+        alignment = 2
+        default_margin_v = 220
+    else:
+        alignment = 2
+        default_margin_v = 32
+
+    margin_v = default_margin_v if margin_v is None else max(0, min(int(margin_v), 500))
+    font_size = max(12, min(int(font_size), 96))
+    outline_width = max(0, min(int(outline_width), 8))
+    shadow = max(0, min(int(shadow), 5))
+    font_name = re.sub(r"[^\w\s\-]", "", str(font_name or "Arial")).strip() or "Arial"
+    animation = str(animation or "none").strip().lower()
+
+    if animation == "fade":
+        override = r"{\fad(120,120)}"
+    elif animation == "popup":
+        override = r"{\fscx80\fscy80\t(0,140,\fscx100\fscy100)}"
+    else:
+        override = ""
+
+    blocks = parse_srt_blocks(srt_path)
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        (
+            "Style: Default,"
+            f"{font_name},{font_size},{hex_to_ass_color(primary_color)},&H000000FF,{hex_to_ass_color(outline_color)},&H80000000,"
+            f"0,0,0,0,100,100,0,0,1,{outline_width},{shadow},{alignment},60,60,{margin_v},1"
+        ),
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for block in blocks:
+        lines.append(f"Dialogue: 0,{block['start']},{block['end']},Default,,0,0,0,,{override}{block['text']}")
+
+    ass_path.parent.mkdir(exist_ok=True, parents=True)
+    ass_path.write_text("\n".join(lines), encoding="utf-8")
+    return ass_path
+
+
+def build_subtitle_filter(
+    srt_path: Path,
+    position: str = "bottom",
+    font_size: int = 28,
+    font_name: str = "Arial",
+    primary_color: str = "#FFFFFF",
+    outline_color: str = "#000000",
+    outline_width: int = 2,
+    shadow: int = 1,
+    margin_v: Optional[int] = None,
+    animation: str = "none",
+) -> str:
+    animation = str(animation or "none").strip().lower()
+    subtitle_path = srt_path
+    if animation in {"fade", "popup"}:
+        subtitle_path = build_ass_from_srt(
+            srt_path=srt_path,
+            ass_path=srt_path.with_suffix(".ass"),
+            position=position,
+            font_size=font_size,
+            font_name=font_name,
+            primary_color=primary_color,
+            outline_color=outline_color,
+            outline_width=outline_width,
+            shadow=shadow,
+            margin_v=margin_v,
+            animation=animation,
+        )
+
+    srt_filter_path = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
 
     if position == "center":
         alignment = 5
-        margin_v = 0
+        default_margin_v = 0
     elif position == "upper_bottom":
         alignment = 2
-        margin_v = 260
+        default_margin_v = 220
     else:
         alignment = 2
-        margin_v = 80
+        default_margin_v = 32
 
+    margin_v = default_margin_v if margin_v is None else max(0, min(int(margin_v), 500))
     font_size = max(12, min(int(font_size), 72))
+    outline_width = max(0, min(int(outline_width), 8))
+    shadow = max(0, min(int(shadow), 5))
+    font_name = re.sub(r"[^\w\s\-]", "", str(font_name or "Arial")).strip() or "Arial"
     force_style = (
-        f"FontName=Arial,FontSize={font_size},"
-        f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-        f"Outline=2,Shadow=1,Alignment={alignment},MarginV={margin_v}"
+        f"FontName={font_name},FontSize={font_size},"
+        f"PrimaryColour={hex_to_ass_color(primary_color)},OutlineColour={hex_to_ass_color(outline_color, '#000000')},"
+        f"Outline={outline_width},Shadow={shadow},Alignment={alignment},MarginV={margin_v}"
     )
 
     return f"subtitles='{srt_filter_path}':force_style='{force_style}'"
@@ -3308,7 +3827,14 @@ def export_clip_with_optional_srt(
     burn_subtitles: bool = False,
     aspect_mode: str = "original",
     subtitle_position: str = "bottom",
-    subtitle_font_size: int = 28
+    subtitle_font_size: int = 28,
+    subtitle_font_name: str = "Arial",
+    subtitle_primary_color: str = "#FFFFFF",
+    subtitle_outline_color: str = "#000000",
+    subtitle_outline_width: int = 2,
+    subtitle_shadow: int = 1,
+    subtitle_margin_v: Optional[int] = None,
+    subtitle_animation: str = "none",
 ) -> Path:
     """
     Экспортирует выбранный клип.
@@ -3337,7 +3863,18 @@ def export_clip_with_optional_srt(
 
     if burn_subtitles and srt_path is not None and srt_path.exists():
         variant_parts.append("subs")
-        filters.append(build_subtitle_filter(srt_path, position=subtitle_position, font_size=subtitle_font_size))
+        filters.append(build_subtitle_filter(
+            srt_path,
+            position=subtitle_position,
+            font_size=subtitle_font_size,
+            font_name=subtitle_font_name,
+            primary_color=subtitle_primary_color,
+            outline_color=subtitle_outline_color,
+            outline_width=subtitle_outline_width,
+            shadow=subtitle_shadow,
+            margin_v=subtitle_margin_v,
+            animation=subtitle_animation,
+        ))
 
     variant_suffix = f"_{'_'.join(variant_parts)}" if variant_parts else ""
     clip_path = out_dir / f"clip_{clip_id:03d}_{title}_{start:.2f}_{end:.2f}{variant_suffix}.mp4"
@@ -3425,6 +3962,13 @@ def export_clip_with_optional_srt(
                     "aspect_mode": aspect_mode,
                     "subtitle_position": subtitle_position,
                     "subtitle_font_size": subtitle_font_size,
+                    "subtitle_font_name": subtitle_font_name,
+                    "subtitle_primary_color": subtitle_primary_color,
+                    "subtitle_outline_color": subtitle_outline_color,
+                    "subtitle_outline_width": subtitle_outline_width,
+                    "subtitle_shadow": subtitle_shadow,
+                    "subtitle_margin_v": subtitle_margin_v,
+                    "subtitle_animation": subtitle_animation,
                 }
             )
 
